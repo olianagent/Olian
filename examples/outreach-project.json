@@ -1,0 +1,12 @@
+{
+  "agent": {"role": "Outreach manager", "tone": "warm, concise, never pushy", "language": "en",
+            "rules": ["Never promise prices or availability you cannot verify", "Stop immediately if asked"]},
+  "channels": {"telegram": {"bot_token": "123456:BOT-TOKEN-FROM-BOTFATHER"}},
+  "outreach": {"require_approval": true, "max_lead_age_minutes": 30, "min_interval_seconds": 60,
+               "window": {"start": 9, "end": 20, "utc_offset": 8}},
+  "signals": {"rules": [
+    {"name": "bali-stay", "keywords": ["glamping", "villa", "where to stay"], "exclude": ["sell", "for sale"],
+     "action": "lead", "channel": "telegram", "address_field": "user.username", "name_field": "user.name",
+     "ai_qualify": true, "auto_draft": true}]},
+  "sandbox": {"backend": "local"}
+}

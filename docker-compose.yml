@@ -1,0 +1,17 @@
+services:
+  olian:
+    build:
+      context: .
+      args:
+        HERMES_REF: main          # pin a tag/commit for reproducible builds
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8600:8600"     # put a TLS reverse proxy in front for the WhatsApp/webhook endpoints
+    volumes:
+      - olian-data:/data
+      # Docker-sandboxed scrapers / Hermes docker backend need the host Docker socket. That is root-equivalent
+      # on the host: enable it only knowingly. Otherwise use sandbox.backend=local (the container is the boundary).
+      # - /var/run/docker.sock:/var/run/docker.sock
+volumes:
+  olian-data:
