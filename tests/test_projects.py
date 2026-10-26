@@ -90,7 +90,7 @@ def test_gateway_lifecycle_survives_a_new_orchestrator_process(core, tmp_path):
     """start in one process object, stop from a fresh Runtime (== a later `olian project stop`): no orphans."""
     import os, stat
     fake = tmp_path / "hermes"
-    fake.write_text("#!/bin/sh\nexec sleep 300 'gateway' \"$@\"\n")  # cmdline contains 'gateway'
+    fake.write_text("#!/bin/sh\nexec sleep 300\n")
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     core.s.hermes_mode, core.s.hermes_bin = "process", str(fake)
     core.projects.create("alpha", "A")

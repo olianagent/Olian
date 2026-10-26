@@ -10,7 +10,7 @@ RUN git clone --depth 1 --branch "${HERMES_REF}" https://github.com/NousResearch
 WORKDIR /app
 COPY pyproject.toml ./
 COPY olian ./olian
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir '.[tguser]'
 RUN useradd -m -u 10001 olian && mkdir -p /data && chown olian /data
 USER olian
 ENV OLIAN_DATA_DIR=/data OLIAN_HOST=0.0.0.0 OLIAN_HERMES_BIN=hermes HOME=/data/home

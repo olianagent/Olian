@@ -38,3 +38,4 @@ tr.click:hover{background:var(--bg)}
 .notice{border-left:3px solid var(--warn);padding:6px 10px;background:var(--bg);margin:8px 0}
 dialog{border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);max-width:760px;width:94vw}
 dialog::backdrop{background:rgba(0,0,0,.45)}
+[hidden]{display:none !important}

@@ -81,8 +81,22 @@ ALTER TABLE senders ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_leads_addr ON leads(project_id, address);
 """
 
+V4 = """
+CREATE TABLE tg_accounts (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  label TEXT NOT NULL, phone_hint TEXT NOT NULL DEFAULT '', api_id INTEGER NOT NULL,
+  api_hash_enc TEXT NOT NULL, session_enc TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', status_reason TEXT NOT NULL DEFAULT '',
+  me TEXT NOT NULL DEFAULT '{}', first_send_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+  PRIMARY KEY (project_id, label));
+ALTER TABLE senders ADD COLUMN paused_until REAL NOT NULL DEFAULT 0;
+ALTER TABLE tg_messages ADD COLUMN author_username TEXT;
+ALTER TABLE tg_leads ADD COLUMN author_username TEXT;
+ALTER TABLE tg_leads ADD COLUMN author_id TEXT;
+"""
+
 # (version, sql). v1 is supplied by db.py (the original schema; every statement is IF NOT EXISTS).
-MIGRATIONS = [(2, V2), (3, V3)]
+MIGRATIONS = [(2, V2), (3, V3), (4, V4)]
 
 
 def apply(conn: sqlite3.Connection, v1_sql: str) -> int:

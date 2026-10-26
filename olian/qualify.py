@@ -222,6 +222,27 @@ class LLMQualifier:
                 "reason": str(v.get("reason", ""))[:300], "qualifier": self.name}
 
 
+def chat_complete(cfg: dict, http: Any, system: str, user: str) -> str:
+    """Plain chat-completions call: no tools, no functions. Used for every prompt that contains strangers' text."""
+    import os
+    base = (cfg.get("base_url") or "").rstrip("/")
+    key = (os.environ.get(cfg["api_key_env"], "") if cfg.get("api_key_env") else "") or cfg.get("api_key", "")
+    headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
+    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+    try:
+        r = http.post(f"{base}/chat/completions", headers=headers, timeout=float(cfg.get("timeout", 30)),
+                      json={"model": cfg["model"], "temperature": float(cfg.get("temperature", 0.4)),
+                            "max_tokens": int(cfg.get("max_tokens", 400)), "messages": msgs})
+    except httpx.HTTPError as e:
+        raise QualifyError(f"llm unreachable ({type(e).__name__})") from None
+    if r.status_code != 200:
+        raise QualifyError(f"llm error {r.status_code}")
+    try:
+        return r.json()["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, ValueError, TypeError):
+        raise QualifyError("llm returned an unusable answer") from None
+
+
 # --------------------------------------------------------------------------- combined
 class Qualifier:
     """mode: rules | llm | hybrid. In hybrid the model is asked only when the rules are unsure (saves tokens)."""

@@ -32,13 +32,18 @@
 
 | Захист | Де | Тест |
 |---|---|---|
-| Автоматичних холодних DM немає: лідів з моніторингу не можна контактувати без записаної підстави | `Outreach.contact_block` | `test_authors_of_monitored_posts_cannot_be_contacted_without_basis` |
+| Лідам з моніторингу **за замовчуванням** не можна писати без записаної підстави; адмін може свідомо дозволити (`outreach.cold_contact`), рішення в журналі | `Outreach.contact_block` | `test_authors_of_monitored_posts_cannot_be_contacted_without_basis`, `test_cold_contact_is_blocked_until_the_admin_allows_it` |
 | Усі повідомлення лише після схвалення людини; агент може тільки чернетки | `require_approval` | `test_agent_only_drafts_human_approves…` |
 | Аварійний вимикач: сигнал ліміту платформи (`PEER_FLOOD`, 429, 131048…) або 3 збої поспіль → відправник `tripped`; без переходу на інший акаунт; увімкнути лише admin | `Outreach.trip/check_health` | `test_platform_limit_signal_trips…`, `test_tripped_sender_needs_an_admin…` |
 | Вимикач за скаргами/відписками (≥3 скарг або ≥25% відписок за 7 днів) зупиняє всі відправники проєкту | `check_health` | `test_complaints_trip_everything`, `test_high_optout_rate_trips` |
 | Ліміти на людину: ≤3 повідомлення без відповіді, ≥72 год між ними; відповідь людини знімає обмеження | `send_due` | `test_per_person_limits_unless_they_reply` |
 | Загальний денний ліміт проєкту, вікно годин, пейсинг, ліміт на відправника | `send_due`, `_pick_sender` | `test_project_daily_cap`, `test_window_caps_pacing_and_rotation` |
-| Один відправник на канал Telegram: без ротації/failover | `_pick_sender` | `test_telegram_has_no_account_rotation_or_failover` |
+| Людина закріплена за **одним** акаунтом; якщо він на паузі/зупинений/на ліміті, її повідомлення чекають, а не йдуть через інший | `_pick_sender` | `test_a_person_stays_with_one_telegram_account_and_never_fails_over` |
+| Новий акаунт стартує з малим лімітом (3→5→8/день), `FloodWait` ставить паузу рівно на вказаний час, `PEER_FLOOD`/втрата сесії зупиняють | `_cap`, `send_due` | `test_a_new_account_starts_with_a_low_daily_cap…`, `test_flood_wait_pauses_only_that_account…`, `test_peer_flood_trips…`, `test_lost_session_marks…` |
+| Помилки про отримувача (приватність, блок) не карають акаунт | `send_due` | `test_recipient_side_errors_do_not_punish_the_account` |
+| Стоп-слова лише цілими словами («стоп» не спрацьовує в «листопад») | `has_word` | `test_innocent_words_do_not_trigger_stop_or_complaint_logic` |
+| Текст незнайомців іде в модель **без інструментів Olian** (або прямий виклик без інструментів) | `App.complete`, `NO_TOOLS` | `test_strangers_text_never_runs_with_olian_tools`, `test_direct_endpoint_without_tools_is_preferred…` |
+| Сесії Telegram зберігаються лише зашифрованими; код входу, номер, api_hash, пароль 2FA не потрапляють в аудит і списки | `Accounts`, `_redact` | `test_login_flow_validation_and_encrypted_storage`, `test_secrets_stay_out_of_the_audit_log_and_listings` |
 | Глобальний стоп-лист (всі канали), стоп-слова, чернетки й черга скасовуються миттєво | `stop`, `handle_reply` | `test_stoplist_is_cross_channel…`, `test_opt_out_is_final` |
 | Футер з відпискою в першому повідомленні (ст. 14 GDPR) | `send_due` | `test_optout_footer_only_on_first_contact` |
 | WhatsApp: лише офіційний Cloud API, поза 24 год лише шаблон | `_deliver` | `test_whatsapp_cloud_uses_template…` |
@@ -46,10 +51,16 @@
 | Токени маскуються в логах | `app.redact` | `test_tokens_never_reach_logs` |
 | Сторожовий тест: у коді немає ротації акаунтів, пулу проксі, «прогріву», підміни відбитків | — | `test_no_evasion_features_exist_in_the_code_base` |
 
+## 3a. Режим особистих повідомлень (акаунти користувачів)
+
+Реалізовано через Telethon (MTProto) у `olian/tguser.py`: вхід за номером і кодом, шифроване зберігання сесії, відправка в особисті, слухач відповідей, відображення помилок Telegram на наші типи (перевірено на справжніх класах Telethon). **З живим Telegram не запускалось** (мережа та акаунти). Параметри з'єднання Telethon стандартні, нічого не підмінюється.
+
+Механіка відправлення залежить від того, чи може акаунт «розпізнати» отримувача: за `@username` це працює; за одним числовим id Telegram часто відмовляє (`PeerIdInvalid`), тоді лід стає `unreachable`.
+
 ## 4. Що свідомо НЕ реалізовано (і чому)
 
-Ротація акаунтів для продовження розсилки після обмеження, пули резидентних/мобільних проксі, підміна відбитків
-з'єднання (`initConnection`), «прогрів» акаунтів, придбані сесії, масові DM незнайомцям. Це не захист, а **обхід** антиспам-
+Перекидання людини на інший акаунт після обмеження першого, пули резидентних/мобільних проксі, підміна відбитків
+з'єднання (`initConnection`), імітація «людської» активності для «прогріву» акаунтів, придбані сесії. (Розгін ліміту за днями це обмеження, а не імітація.) Це не захист, а **обхід** антиспам-
 системи платформи: він підвищує ризик блокувань усієї «сітки» акаунтів, юридичний ризик (Закон № 480/2004 Coll., GDPR) і
 не усуває причину санкцій, якою є скарги отримувачів. Чесна відповідь на «захист від банів»: єдина надійна стратегія це не
 робити того, за що банять, і вчасно зупинятися.

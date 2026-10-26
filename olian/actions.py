@@ -191,7 +191,25 @@ def register_all(f: Facade) -> None:
     def leads_set_consent(app, pid, actor, id, basis):
         return app.outreach.set_consent(pid, id, f"{basis} (recorded by {actor.label})")
 
+    @f.register("outreach.cold_contact", "Allow or block private messages to authors of monitored posts who gave no consent. "
+                "'allowed' is the project admin's explicit decision and is audited; all limits and the stop-list still apply.", A,
+                {"mode": STR}, ["mode"], agent_ok=False)
+    def outreach_cold(app, pid, actor, mode):
+        if mode not in ("allowed", "blocked"):
+            raise ValueError("mode must be allowed|blocked")
+        app.projects.update_config(pid, {"outreach": {"cold_contact": mode}})
+        return {"cold_contact": mode, "decided_by": actor.label}
+
+    @f.register("outreach.settings", "Effective outreach safety settings of the project (limits, approval, cold-contact mode).", A,
+                agent_ok=False)
+    def outreach_settings(app, pid, actor):
+        pol = app.outreach.policy(pid)
+        keys = ("cold_contact", "require_approval", "daily_cap_total", "max_per_lead", "min_gap_hours", "min_interval_seconds",
+                "max_conversation", "ramp", "window", "footer", "breaker")
+        return {k: pol[k] for k in keys}
+
     _register_monitor(f)
+    _register_accounts(f)
 
 
 def _register_monitor(f: Facade) -> None:
@@ -247,10 +265,16 @@ def _register_monitor(f: Facade) -> None:
         return app.monitor.test_rule(pid, rule, limit)
 
     @f.register("monitor.ingest", "Push one message from an authorised operator client (channel B; disabled by default).", M,
-                {"chat_ref": STR, "message_id": INT, "text": STR, "date": {"type": "number"}, "author_id": STR},
-                ["chat_ref", "message_id", "text"], agent_ok=False)
-    def ingest(app, pid, actor, chat_ref, message_id, text, date=None, author_id=None):
-        return app.monitor.ingest_push(pid, chat_ref, message_id, text, date, author_id)
+                {"chat_ref": STR, "message_id": INT, "text": STR, "date": {"type": "number"}, "author_id": STR,
+                 "author_username": STR}, ["chat_ref", "message_id", "text"], agent_ok=False)
+    def ingest(app, pid, actor, chat_ref, message_id, text, date=None, author_id=None, author_username=None):
+        return app.monitor.ingest_push(pid, chat_ref, message_id, text, date, author_id, author_username)
+
+    @f.register("monitor.leads.start_conversation", "Start a private conversation with the author of a lead: the agent writes "
+                "the first message; whether and when it is sent is decided by the contact policy and the limits.", M,
+                {"id": INT, "brief": STR}, ["id"], agent_ok=False)
+    def start_conv(app, pid, actor, id, brief=""):
+        return app.monitor.start_conversation(pid, id, actor.label, brief)
 
     @f.register("monitor.collect", "Poll the Bot API once now.", M, agent_ok=False)
     def collect(app, pid, actor):
@@ -310,6 +334,39 @@ def _register_monitor(f: Facade) -> None:
                 {"author_id": STR}, ["author_id"], agent_ok=False)
     def erase(app, pid, actor, author_id):
         return app.monitor.erase_author(pid, author_id)
+
+
+def _register_accounts(f: Facade) -> None:
+    """Telegram user accounts that send private messages. Sessions are stored encrypted and never returned."""
+
+    @f.register("tg.accounts.list", "Connected Telegram accounts: status, masked phone, today's usage. Secrets are never shown.", A,
+                agent_ok=False)
+    def acc_list(app, pid, actor):
+        senders = {x["label"]: x for x in app.outreach.senders_public(pid)}
+        out = app.tguser.list(pid)
+        for a in out:
+            sd = senders.get(a["label"])
+            a["sender"] = {"status": sd["status"], "reason": sd["status_reason"], "daily_cap": sd["daily_cap"],
+                           "sent_today": sd["sent_today"], "paused_until": sd.get("paused_until", 0)} if sd else None
+        return out
+
+    @f.register("tg.accounts.login_start", "Step 1: send a login code to the account's phone number (+380...). api_id/api_hash "
+                "come from my.telegram.org for that account.", A,
+                {"label": STR, "phone": STR, "api_id": INT, "api_hash": STR}, ["label", "phone", "api_id", "api_hash"], agent_ok=False)
+    def acc_start(app, pid, actor, label, phone, api_id, api_hash):
+        return app.tguser.login_start(pid, label, phone, api_id, api_hash)
+
+    @f.register("tg.accounts.login_code", "Step 2: enter the code Telegram sent (and the 2FA password if the account has one). "
+                "Creates the sender with a low daily cap.", A, {"label": STR, "code": STR, "password": STR, "daily_cap": INT},
+                ["label", "code"], agent_ok=False)
+    def acc_code(app, pid, actor, label, code, password=None, daily_cap=10):
+        return app.tguser.login_code(pid, label, code, password, daily_cap)
+
+    @f.register("tg.accounts.remove", "Disconnect an account: logs the session out at Telegram and deletes it here.", A,
+                {"label": STR}, ["label"], agent_ok=False)
+    def acc_remove(app, pid, actor, label):
+        app.tguser.remove(pid, label)
+        return {"ok": True}
 
 
 __all__ = ["register_all", "format_task"]

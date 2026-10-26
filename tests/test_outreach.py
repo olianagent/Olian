@@ -170,11 +170,49 @@ def test_authors_of_monitored_posts_cannot_be_contacted_without_basis(core, proj
     assert "legal basis" in core.outreach.message(proj, m["id"])["error"]
 
 
-def test_telegram_has_no_account_rotation_or_failover(core, proj, noon):
+def test_a_person_stays_with_one_telegram_account_and_never_fails_over(core, proj, noon):
     core.outreach.add_sender(proj, "a", "dryrun", {}, 1)
     core.outreach.add_sender(proj, "b", "dryrun", {}, 50)
-    ids = [core.outreach.compose(proj, core.outreach.add_lead(proj, "telegram", f"@u{i}")["id"], "x", approve=True)["id"]
-           for i in range(3)]
-    r = core.outreach.send_due(proj, noon)
-    assert r["sent"] == 1 and "no sender with capacity" in r["skipped"]        # 'b' is NOT used when 'a' hits its cap
-    assert {core.outreach.message(proj, i)["sender"] for i in ids if core.outreach.message(proj, i)["status"] == "sent"} == {"a"}
+    first = core.outreach.compose(proj, core.outreach.add_lead(proj, "telegram", "@first")["id"], "hi", approve=True)
+    core.outreach.send_due(proj, noon)
+    owner = core.outreach.message(proj, first["id"])["sender"]
+    assert owner in ("a", "b")
+    lead = core.outreach.lead_by_addr(proj, "telegram", "@first")
+    assert json.loads(lead["data"])["assigned_sender"] == owner                # the conversation belongs to this account
+    # the owner trips: that person's follow-up waits; it is NOT handed to the healthy account
+    core.outreach.trip(proj, "test", owner)
+    core.projects.update_config(proj, {"outreach": {"min_gap_hours": 0}})
+    follow = core.outreach.compose(proj, lead["id"], "follow-up", approve=True)
+    r = core.outreach.send_due(proj, noon + 600)
+    assert core.outreach.message(proj, follow["id"])["status"] == "approved" and r["sent"] == 0
+    assert "no sender with capacity" in r["skipped"]
+    # whereas a NEW person can go to the other active account
+    other = core.outreach.compose(proj, core.outreach.add_lead(proj, "telegram", "@second")["id"], "hello", approve=True)
+    core.outreach.send_due(proj, noon + 700)
+    assert core.outreach.message(proj, other["id"])["sender"] not in ("", owner)
+
+
+@pytest.mark.parametrize("text", ["Які є дати у листопаді?", "Є інтернет у номері?", "Також цікавить вартість", "Скільки це буде?",
+                                  "Ми зараз на відпочинку, напишу згодом"])
+def test_innocent_words_do_not_trigger_stop_or_complaint_logic(core, proj, agent, text):
+    sender(core, proj)
+    l = lead(core, proj)
+    agent.script = [json.dumps({"intent": "other", "summary": "", "reply": ""})]
+    out = core.outreach.handle_reply(proj, "whatsapp", "420777111222", text)
+    assert out["intent"] != "opt_out" and core.outreach.lead(proj, l["id"])["status"] != "opted_out"
+    assert not core.db.one("SELECT 1 FROM events WHERE kind IN ('optout','complaint')")
+
+
+@pytest.mark.parametrize("text", ["стоп", "Стоп.", "STOP", "Не пишіть мені більше", "будь ласка, відпишіть мене", "unsubscribe"])
+def test_real_stop_requests_are_still_caught(core, proj, text):
+    sender(core, proj)
+    l = lead(core, proj)
+    assert core.outreach.handle_reply(proj, "whatsapp", "420777111222", text)["intent"] == "opt_out"
+
+
+def test_keyword_fallback_uses_whole_words_too(core, proj, agent):
+    lead(core, proj)
+    agent.script = [lambda m: (_ for _ in ()).throw(HermesError("down"))]
+    assert core.outreach.handle_reply(proj, "whatsapp", "420777111222", "Є інтернет і вікно на море?")["intent"] == "other"
+    agent.script = [lambda m: (_ for _ in ()).throw(HermesError("down"))]
+    assert core.outreach.handle_reply(proj, "whatsapp", "420777111222", "ні, дякую")["intent"] == "negative"

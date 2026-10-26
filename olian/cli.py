@@ -75,6 +75,15 @@ def main(argv: list[str] | None = None) -> int:
     mi.add_argument("--author", default="hash", choices=["hash", "raw", "none"])
     me_ = mos.add_parser("evaluate", help="precision/recall on a labelled JSON sample [{text, expected}]")
     me_.add_argument("project"); me_.add_argument("samples")
+    tg = sub.add_parser("tg", help="Telegram user accounts that send private messages")
+    tgs = tg.add_subparsers(dest="tgsub", required=True)
+    tl_ = tgs.add_parser("login", help="connect an account: phone number + code once, then no phone is needed")
+    tl_.add_argument("project"); tl_.add_argument("label"); tl_.add_argument("--phone", required=True, help="+380XXXXXXXXX")
+    tl_.add_argument("--api-id", type=int, required=True, help="from my.telegram.org (for this account)")
+    tl_.add_argument("--api-hash", default="", help="or set TG_API_HASH / be prompted (keeps it out of shell history)")
+    tl_.add_argument("--cap", type=int, default=10, help="messages per day once the account is past its ramp-up")
+    tgs.add_parser("list").add_argument("project")
+    tr_ = tgs.add_parser("remove"); tr_.add_argument("project"); tr_.add_argument("label")
     bk = sub.add_parser("backup", help="consistent, encrypted snapshot of the database")
     bk.add_argument("--out", default=""); bk.add_argument("--plain", action="store_true", help="allow an UNENCRYPTED backup")
     rs = sub.add_parser("restore", help="restore a backup into a (new) data directory")
@@ -150,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
         print(_j({k: v for k, v in res.items() if k != "mismatches"}))
         for m in res["mismatches"][:20]:
             print(f"  {'FN' if m['expected'] else 'FP'} {m['text'][:90]!r} -> {m['why'][:90]}")
+    elif args.cmd == "tg":
+        return tg_command(core, args)
     elif args.cmd == "backup":
         return backup(core, args.out, args.plain)
     elif args.cmd == "serve":
@@ -162,6 +173,47 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def tg_command(core: App, a) -> int:
+    import getpass
+    if a.tgsub == "list":
+        for r in core.tguser.list(a.project):
+            print(f"{r['label']:<14} {r['status']:<10} {r['phone_hint']:<16} @{r['me'].get('username', '') or '—'} {r['status_reason']}")
+        return 0
+    if a.tgsub == "remove":
+        core.tguser.remove(a.project, a.label)
+        print("account logged out at Telegram and deleted here")
+        return 0
+    api_hash = a.api_hash or os.environ.get("TG_API_HASH") or getpass.getpass("api_hash (hidden): ")
+    try:
+        r = core.tguser.login_start(a.project, a.label, a.phone, a.api_id, api_hash)
+    except (ValueError, RuntimeError) as e:
+        print(f"cannot start login: {e}")
+        return 1
+    print(f"Telegram sent a login code to {r['phone']} (SMS or the Telegram app that is already logged in).")
+    password = None
+    for _ in range(3):
+        code = getpass.getpass("code (hidden): ")
+        try:
+            out = core.tguser.login_code(a.project, a.label, code, password, a.cap)
+            break
+        except ValueError as e:
+            if "two-step" in str(e) and not password:
+                password = getpass.getpass("two-step verification password (hidden): ")
+                try:
+                    out = core.tguser.login_code(a.project, a.label, code, password, a.cap)
+                    break
+                except ValueError as e2:
+                    print(e2)
+                    continue
+            print(e)
+    else:
+        print("login not completed")
+        return 1
+    print(f"connected as @{out['me'].get('username') or out['me'].get('first_name')}; sender '{out['sender']}' created "
+          f"(new accounts start with a low daily cap and ramp up; see outreach.ramp)")
+    return 0
+
+
 def setup_env() -> int:
     import secrets
     from cryptography.fernet import Fernet
@@ -171,12 +223,14 @@ def setup_env() -> int:
         return 1
     lines = [f"OLIAN_API_KEY={secrets.token_urlsafe(32)}", f"OLIAN_WEBHOOK_SECRET={secrets.token_urlsafe(32)}",
              f"OLIAN_PII_SALT={secrets.token_hex(32)}", f"OLIAN_BACKUP_KEY={Fernet.generate_key().decode()}",
+             f"OLIAN_SESSION_KEY={Fernet.generate_key().decode()}",
              "OLIAN_DATA_DIR=./data", "OLIAN_PORT_BASE=8700", "OLIAN_DEFAULT_PROVIDER=", "OLIAN_DEFAULT_MODEL=",
              "WHATSAPP_CLOUD_TOKEN=", "WHATSAPP_VERIFY_TOKEN=", "WHATSAPP_APP_SECRET=", "OLIAN_NOTIFY_TELEGRAM_TOKEN="]
     path.write_text("\n".join(lines) + "\n")
     path.chmod(0o600)
-    print("wrote .env (0600) with fresh secrets. KEEP A COPY OF OLIAN_BACKUP_KEY AND OLIAN_PII_SALT somewhere safe:\n"
-          "without the backup key encrypted backups cannot be opened; losing the PII salt makes stored pseudonyms unlinkable.")
+    print("wrote .env (0600) with fresh secrets. KEEP A COPY OF OLIAN_BACKUP_KEY, OLIAN_SESSION_KEY AND OLIAN_PII_SALT somewhere safe:\n"
+          "without the backup key encrypted backups cannot be opened; without the session key stored Telegram sessions are "
+          "unreadable (accounts must be logged in again); losing the PII salt makes stored pseudonyms unlinkable.")
     return 0
 
 

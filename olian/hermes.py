@@ -126,6 +126,14 @@ def _proc_state(n: int) -> str:
         return ""
 
 
+def _proc_start(n: int) -> str:
+    """Process start time in clock ticks since boot (field 22 of /proc/<pid>/stat); '' where /proc is unavailable."""
+    try:
+        return Path(f"/proc/{n}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
 class Runtime:
     """Starts/stops one `hermes gateway run --force` per project, each with its own HERMES_HOME.
 
@@ -146,8 +154,12 @@ class Runtime:
         return self.home(pid) / "olian-gateway.pid"
 
     def _read_pid(self, pid: str) -> int | None:
+        """The pidfile holds `pid:starttime`. A pid is ours only if it exists AND its kernel start time still matches, which
+        defeats pid reuse without parsing command lines (those are unreliable while a process is mid-exec)."""
         try:
-            n = int(self._pidfile(pid).read_text().strip())
+            raw = self._pidfile(pid).read_text().strip()
+            n, _, started = raw.partition(":")
+            n = int(n)
         except (OSError, ValueError):
             return None
         try:
@@ -156,15 +168,10 @@ class Runtime:
             return None
         except PermissionError:
             return n
-        state = _proc_state(n)
-        if state in ("Z", "X"):  # exited (zombie awaiting reap) == dead
+        if _proc_state(n) in ("Z", "X"):  # exited, waiting to be reaped == dead
             return None
-        try:  # guard against pid reuse: a live process must still be one of ours. During exit the kernel empties
-            cmd = Path(f"/proc/{n}/cmdline").read_bytes()  # cmdline before the state flips, so empty != foreign
-            if cmd and b"gateway" not in cmd:
-                return None
-        except OSError:
-            pass
+        if started and _proc_start(n) not in ("", started):
+            return None
         return n
 
     def alive(self, pid: str) -> bool:
@@ -188,7 +195,7 @@ class Runtime:
         p = subprocess.Popen([self.s.hermes_bin, "gateway", "run", "--force"], env=env, cwd=home,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         self.procs[pid] = p
-        self._pidfile(pid).write_text(str(p.pid))
+        self._pidfile(pid).write_text(f"{p.pid}:{_proc_start(p.pid)}")
         return p.pid
 
     def stop(self, pid: str) -> None:

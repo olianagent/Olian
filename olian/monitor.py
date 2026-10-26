@@ -29,6 +29,9 @@ DEFAULTS: dict[str, Any] = {
     "near_distance": 16, "near_jaccard": 0.8, "window_days": 30, "author_window_days": 14, "reopen_processed": False,
     "push_enabled": False, "max_attempts": 3, "notify": True, "notify_max_per_run": 5,
     "check_interval_seconds": 1800, "contact": {"allowed_ways": []},
+    # Needed only if you want to write to authors privately: keep their @username (and raw id with author="raw").
+    "store_username": False,
+    "autopilot": {"enabled": False, "min_confidence": 0.7, "brief": ""},
 }
 MAX_TEXT = 4000
 EXPORT_COLUMNS = ["id", "created_at", "status", "category", "service", "relevance_score", "confidence", "source",
@@ -243,7 +246,7 @@ class Monitor:
         return ""
 
     def ingest_message(self, pid: str, chat_ref: str, tg_message_id: int, text: str, date: float | None = None,
-                       author_id: Any = None) -> dict:
+                       author_id: Any = None, author_username: str | None = None) -> dict:
         cfg, now = self.cfg(pid), time.time()
         src = self._source_by_ref(pid, chat_ref)
         if not src:
@@ -261,9 +264,10 @@ class Monitor:
         hits = self.match(self.rules(pid, only_enabled=True), norm)
         mid = self.db.x(
             "INSERT INTO tg_messages(project_id,source_id,tg_message_id,message_date,text,norm_hash,simhash,author_ref,matched,"
-            "rule_hits,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "rule_hits,state,created_at,author_username) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, src["id"], int(tg_message_id), float(date or now), text, nh, sh, self.author_ref(pid, author_id),
-             1 if hits else 0, json.dumps(hits, ensure_ascii=False), "received", now))
+             1 if hits else 0, json.dumps(hits, ensure_ascii=False), "received", now,
+             (author_username or "").lstrip("@")[:64] or None if cfg["store_username"] else None))
         self.db.x("UPDATE tg_sources SET msg_count=msg_count+1, last_ok_at=? WHERE id=?", (now, src["id"]))
         if not hits:
             return {"result": "no_match", "message_row_id": mid}
@@ -279,14 +283,14 @@ class Monitor:
         return {"result": "queued", "message_row_id": mid}
 
     def ingest_push(self, pid: str, chat_ref: str, tg_message_id: int, text: str, date: float | None = None,
-                    author_id: Any = None) -> dict:
+                    author_id: Any = None, author_username: str | None = None) -> dict:
         """Channel B: messages pushed by an operator-run authorised client. Off unless explicitly enabled (TZ §10, ADR-1)."""
         if not self.cfg(pid)["push_enabled"]:
             raise ValueError("push ingestion is disabled (monitor.push_enabled); it needs a documented decision first")
         src = self._source_by_ref(pid, chat_ref)
         if src and src["ingest"] != "push":
             raise ValueError("this source is collected through the Bot API, not pushed")
-        return self.ingest_message(pid, chat_ref, tg_message_id, text, date, author_id)
+        return self.ingest_message(pid, chat_ref, tg_message_id, text, date, author_id, author_username)
 
     def _find_duplicate(self, pid: str, mid: int, nh: str, sh: str, norm: str, cfg: dict):
         cutoff = time.time() - cfg["window_days"] * 86400
@@ -333,6 +337,16 @@ class Monitor:
                 new_leads.append(lead_id)
         if new_leads and cfg["notify"]:
             self._notify(pid, new_leads, cfg["notify_max_per_run"])
+        ap = cfg["autopilot"]
+        if ap.get("enabled"):
+            for lid in new_leads:
+                l = self.lead(pid, lid)
+                if l["status"] == "new" and l["confidence"] >= ap.get("min_confidence", 0.7):
+                    try:
+                        self.start_conversation(pid, lid, "autopilot", ap.get("brief", ""))
+                        stats["conversations"] = stats.get("conversations", 0) + 1
+                    except Exception as e:  # noqa: BLE001  one bad lead must not stop the queue
+                        self.add_note(pid, lid, f"автопілот не розпочав діалог: {str(e)[:200]}", "autopilot")
         return stats
 
     def _decide(self, pid: str, row: dict, v: dict, cfg: dict) -> tuple[int | None, str]:
@@ -356,11 +370,12 @@ class Monitor:
         status = "review" if (v["confidence"] < cfg["review_below"] or v.get("needs_review")) else "new"
         lid = self.db.x(
             "INSERT INTO tg_leads(project_id,source_id,message_row_id,tg_message_id,message_date,message_text,message_url,"
-            "author_ref,category,service,relevance_score,confidence,qualification_reason,qualifier,status,last_seen_at,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "author_ref,category,service,relevance_score,confidence,qualification_reason,qualifier,status,last_seen_at,created_at,"
+            "author_username,author_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, row["source_id"], row["id"], row["tg_message_id"], row["message_date"], row["text"],
              self.message_url(src, row["tg_message_id"]) if src.get("chat_ref") else "", row["author_ref"], v["category"],
-             v["service"], v["score"], v["confidence"], v["reason"], v["qualifier"], status, now, now))
+             v["service"], v["score"], v["confidence"], v["reason"], v["qualifier"], status, now, now,
+             row.get("author_username"), row["author_ref"] if cfg["author"] == "raw" else None))
         self.db.x("INSERT INTO tg_lead_history(lead_id,actor,from_status,to_status,note,created_at) VALUES(?,?,?,?,?,?)",
                   (lid, "system", "", status, v["reason"][:300], now))
         self.db.x("UPDATE tg_messages SET state='qualified', lead_id=?, verdict=? WHERE id=?", (lid, verdict, row["id"]))
@@ -439,6 +454,26 @@ class Monitor:
         self.db.x("INSERT INTO tg_lead_history(lead_id,actor,from_status,to_status,note,created_at) VALUES(?,?,?,?,?,?)",
                   (lid, actor, l["status"], l["status"], "note: " + note[:300], time.time()))
         return self.lead(pid, lid)
+
+    def start_conversation(self, pid: str, lid: int, actor: str, brief: str = "") -> dict:
+        """Turn a monitored lead into a private conversation: the agent writes the first message, the contact policy decides
+        whether it may go out (cold_contact / consent), the outreach limits decide when. Returns the drafted message."""
+        l = self.lead(pid, lid)
+        if l["status"] in ("irrelevant", "excluded"):
+            raise ValueError(f"lead is {l['status']}")
+        addr = f"@{l['author_username']}" if l["author_username"] else (l["author_id"] or "")
+        if not addr:
+            raise ValueError("no way to address the author: enable monitor.store_username (and author: raw for ids)")
+        ol = self.app.outreach.add_lead(pid, "telegram", addr, source=f"monitor:{lid}", detected_at=l["message_date"],
+                                        data={"post": l["message_text"][:600], "category": l["category"], "service": l["service"],
+                                              "post_url": l["message_url"], "monitor_lead": lid})
+        if ol["status"] == "opted_out":
+            raise ValueError("the person is on the stop-list")
+        extra = (brief + " " if brief else "") + f"Their post asked about: {l['service'] or l['category']}."
+        msg = self.app.outreach.draft(pid, ol["id"], brief=extra)
+        self.set_status(pid, lid, "processed" if l["status"] == "new" else l["status"], actor,
+                        f"діалог розпочато (чернетка #{msg['id']}, {msg['status']})")
+        return msg
 
     def delete_lead(self, pid: str, lid: int) -> None:
         self.lead(pid, lid)
@@ -531,7 +566,7 @@ class Monitor:
                   ((chat.get("title") or src["title"])[:200], (chat.get("username") or src["username"])[:64],
                    chat.get("type", src["kind"]), src["id"]))
         out = self.ingest_message(pid, ref, msg.get("message_id", 0), msg.get("text") or msg.get("caption") or "",
-                                  msg.get("date"), frm.get("id"))
+                                  msg.get("date"), frm.get("id"), frm.get("username"))
         res["ingested" if out["result"] in ("queued", "no_match", "duplicate") else "ignored"] += 1
 
     def _note_candidate(self, pid: str, chat: dict) -> None:

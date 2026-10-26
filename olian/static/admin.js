@@ -60,12 +60,12 @@ function login() {
 
 function shell() {
   const app = $('#app'); app.replaceChildren();
-  const tabs = [['leads', 'Ліди'], ['sources', 'Джерела'], ['rules', 'Правила'], ['report', 'Звіти']];
+  const tabs = [['leads', 'Ліди'], ['sources', 'Джерела'], ['rules', 'Правила'], ['report', 'Звіти']].concat(can('admin') ? [['accounts', 'Акаунти']] : []);
   const nav = h('nav', {}, tabs.map(([k, t]) => h('button', { class: S.tab === k ? 'on' : '', onclick: () => { S.tab = k; shell(); } }, t)));
   app.append(h('header', {}, h('h1', {}, `Моніторинг · ${S.me.name} `, h('span', { class: 'muted' }, `(${S.me.role})`)), nav,
     h('button', { class: 'btn sec', onclick: () => { sessionStorage.clear(); S.token = ''; login(); } }, 'Вийти')),
     h('main', {}, h('div', { id: 'toast', class: 'muted' }), h('div', { id: 'view' })));
-  ({ leads: viewLeads, sources: viewSources, rules: viewRules, report: viewReport })[S.tab]();
+  ({ leads: viewLeads, sources: viewSources, rules: viewRules, report: viewReport, accounts: viewAccounts })[S.tab]();
 }
 
 // ------------------------------------------------------------------ leads
@@ -124,6 +124,7 @@ async function openLead(id) {
       h('details', {}, h('summary', {}, 'Історія статусів'), h('ul', {}, l.history.map((x) => h('li', {}, `${fmt(x.created_at)} · ${x.actor}: ${x.from_status || '—'} → ${x.to_status}${x.note ? ' · ' + x.note : ''}`)))),
       can('manager') ? [note, outcome, h('div', { class: 'row' }, STATUSES.map((s) => h('button', { class: 'btn sec', onclick: () => set(s) }, STATUS_UA[s])),
         h('button', { class: 'btn sec', onclick: () => guard(async () => { await api('monitor.leads.note', { id, note: note.value }); dlg.close(); dlg.remove(); viewLeads(); }) }, 'Лише нотатка'))] : null,
+      can('manager') && !['excluded', 'irrelevant'].includes(l.status) ? h('button', { class: 'btn', onclick: () => guard(async () => { const m = await api('monitor.leads.start_conversation', { id }); toast(`Діалог розпочато: чернетка #${m.id} (${m.status})`); dlg.close(); dlg.remove(); viewLeads(); }) }, 'Почати діалог (агент пише першим повідомленням)') : null,
       can('admin') ? h('button', { class: 'btn bad', onclick: () => confirm('Видалити лід і його історію?') && guard(async () => { await api('monitor.leads.delete', { id }); dlg.close(); dlg.remove(); viewLeads(); }) }, 'Видалити лід') : null,
       h('div', { class: 'row' }, h('button', { class: 'btn sec', onclick: () => { dlg.close(); dlg.remove(); } }, 'Закрити')));
     document.body.append(dlg); dlg.showModal();
@@ -204,6 +205,38 @@ async function viewReport() {
       h('div', { class: 'card' }, h('h3', {}, 'Правила'), h('table', {}, h('thead', {}, h('tr', {}, ['Правило', 'Збігів', 'Лідів'].map((t) => h('th', {}, t)))),
         h('tbody', {}, r.rules.map((x) => h('tr', {}, h('td', {}, x.rule), h('td', {}, x.matches), h('td', {}, x.leads)))))),
       h('div', { class: 'card' }, h('h3', {}, 'За днями'), r.daily.map((d) => h('div', { class: 'row' }, h('span', { class: 'muted' }, d.day), (() => { const b = h('div', { class: 'bar' }); b.style.width = Math.round(280 * d.received / max) + 'px'; return b; })(), `${d.received} / збігів ${d.matched || 0}`))));
+  });
+}
+
+// ------------------------------------------------------------------ accounts (admin)
+async function viewAccounts() {
+  const v = $('#view'); const body = h('tbody'); const cold = h('div'); const form = h('div');
+  put(v, h('div', { class: 'card' }, h('h3', {}, 'Акаунти Telegram для особистих повідомлень'),
+    h('p', { class: 'muted' }, 'Нова сесія створюється за номером телефону й кодом, який Telegram надішле один раз. Далі номер і телефон не потрібні: сесія зберігається зашифрованою. Новий акаунт стартує з низького ліміту й поступово його збільшує.'),
+    h('table', {}, h('thead', {}, h('tr', {}, ['Акаунт', 'Статус', 'Відправник', 'Сьогодні', ''].map((t) => h('th', {}, t)))), body)), form, cold);
+  await guard(async () => {
+    const [accs, st] = await Promise.all([api('tg.accounts.list'), api('outreach.settings')]);
+    if (!accs.length) body.append(h('tr', {}, h('td', { colspan: 5, class: 'muted' }, 'Акаунтів ще немає.')));
+    for (const a of accs) {
+      const sd = a.sender;
+      body.append(h('tr', {}, h('td', {}, h('b', {}, a.label), h('div', { class: 'muted' }, `${a.phone_hint} · @${a.me.username || '—'}`)),
+        h('td', {}, badge(a.status === 'active' ? 'active' : 'unavailable', a.status), a.status_reason ? h('div', { class: 'err' }, a.status_reason) : null),
+        h('td', {}, sd ? [badge(sd.status === 'active' ? 'active' : 'unavailable', sd.status), sd.reason ? h('div', { class: 'err' }, sd.reason) : null, sd.paused_until > Date.now() / 1000 ? h('div', { class: 'muted' }, 'пауза до ' + fmt(sd.paused_until)) : null] : '—'),
+        h('td', {}, sd ? `${sd.sent_today} / ${sd.daily_cap}` : '—'),
+        h('td', {}, sd && sd.status === 'tripped' ? h('button', { class: 'btn sec', onclick: () => confirm('Спершу з’ясуйте причину. Увімкнути відправник?') && guard(async () => { await api('outreach.reset_sender', { label: a.label }); viewAccounts(); }) }, 'Скинути вимикач') : null,
+          ' ', h('button', { class: 'btn bad', onclick: () => confirm('Вийти з акаунта в Telegram і видалити сесію?') && guard(async () => { await api('tg.accounts.remove', { label: a.label }); viewAccounts(); }) }, 'Відключити'))));
+    }
+    const label = h('input', { placeholder: 'Назва (напр. acc1)' }), phone = h('input', { placeholder: '+380XXXXXXXXX' }), apiId = h('input', { placeholder: 'api_id', inputmode: 'numeric' }), apiHash = h('input', { placeholder: 'api_hash', type: 'password', autocomplete: 'off' });
+    const code = h('input', { placeholder: 'Код з Telegram', autocomplete: 'off' }), pass = h('input', { placeholder: 'Пароль 2FA (якщо є)', type: 'password', autocomplete: 'off' }), step2 = h('div', { class: 'row' });
+    step2.hidden = true;
+    put(step2, code, pass, h('button', { class: 'btn', onclick: () => guard(async () => { const r = await api('tg.accounts.login_code', { label: label.value.trim(), code: code.value, password: pass.value || undefined }); toast('Підключено: ' + (r.me.username || r.me.first_name)); viewAccounts(); }) }, 'Підтвердити'));
+    put(form, h('div', { class: 'card' }, h('h3', {}, 'Підключити акаунт'), h('div', { class: 'row' }, label, phone, apiId, apiHash,
+      h('button', { class: 'btn', onclick: () => guard(async () => { const r = await api('tg.accounts.login_start', { label: label.value.trim(), phone: phone.value.trim(), api_id: +apiId.value, api_hash: apiHash.value.trim() }); apiHash.value = ''; step2.hidden = false; toast('Код надіслано на ' + r.phone); }) }, 'Надіслати код')), step2,
+      h('p', { class: 'muted' }, 'api_id та api_hash беруться на my.telegram.org для цього ж акаунта. Не використовуйте основний особистий акаунт.')));
+    const mode = h('select', {}, [['blocked', 'Закрито: лише за записаною підставою'], ['allowed', 'Дозволено: писати авторам знайдених дописів']].map(([k, t]) => h('option', { value: k, selected: st.cold_contact === k }, t)));
+    put(cold, h('div', { class: 'card' }, h('h3', {}, 'Холодний контакт'), h('div', { class: 'row' }, mode,
+      h('button', { class: 'btn', onclick: () => confirm('Ви берете на себе рішення писати людям без попередньої згоди. Усі ліміти й стоп-лист лишаються. Зберегти?') && guard(async () => { await api('outreach.cold_contact', { mode: mode.value }); viewAccounts(); }) }, 'Зберегти')),
+      h('p', { class: 'muted' }, `Ліміти: ${st.max_per_lead} повідомлення на людину, пауза ${st.min_gap_hours} год, ${st.daily_cap_total}/день на проєкт, розгін нового акаунта ${st.ramp.join('→')}/день, вікно ${st.window.start}–${st.window.end} (UTC${st.window.utc_offset >= 0 ? '+' : ''}${st.window.utc_offset}). Підтвердження людиною: ${st.require_approval ? 'так' : 'ні'}.`)));
   });
 }
 

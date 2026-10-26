@@ -54,6 +54,8 @@ def install_log_redaction() -> None:
 
 
 SYSTEM = Actor("system", Role.MANAGER)
+# Used whenever the prompt contains text written by strangers: the agent may not call any Olian tool during that turn.
+NO_TOOLS = Actor("untrusted-text", Role.VIEWER, "-none-")
 
 
 class App:
@@ -71,8 +73,11 @@ class App:
         self.tasks = Tasks(self)
         self.outreach = Outreach(self, **kw)
         self.scrapers = Scrapers(self, **kw)
+        self.http = http
         self.signals = Signals(self)
         self.monitor = Monitor(self, **kw)
+        from .tguser import Accounts
+        self.tguser = Accounts(self)
         from .chat import Chat  # late: chat imports facade/actions
         self.chat = Chat(self)
         self.client_factory: Callable[[dict], hermes.Client] = lambda project: hermes.Client(
@@ -85,6 +90,16 @@ class App:
         project = self.projects.get(pid)
         with self.facade.acting(pid, actor or SYSTEM):
             return self.client_factory(project).chat(message, session=session)
+
+    def complete(self, pid: str, prompt: str, system: str = "", session: str | None = None) -> str:
+        """One text completion over UNTRUSTED input. Prefers a direct endpoint without tools (cfg.llm / monitor.llm); otherwise
+        the project's agent with every Olian tool switched off. (Hermes' own built-in tools remain: configure `llm` to avoid that.)"""
+        cfg = self.projects.get(pid)["cfg"]
+        llm = cfg.get("llm") or cfg.get("monitor", {}).get("llm") or {}
+        if llm.get("base_url") and llm.get("model"):
+            from .qualify import chat_complete
+            return chat_complete(llm, self.http or __import__("httpx"), system, prompt)
+        return self.agent_chat(pid, (system + "\n\n" if system else "") + prompt, session=session, actor=NO_TOOLS)
 
     # ----- background
     def tick(self) -> None:
@@ -121,9 +136,11 @@ class App:
         m.start()
         self._threads.append(m)
         from .bridge import TelegramBridge
+        self.tguser.start_all()  # connect connected accounts so replies are heard
         self.telegram = TelegramBridge(self)
         self._threads += self.telegram.start()
 
     def shutdown(self) -> None:
         self._stop.set()
+        self.tguser.shutdown()
         self.runtime.stop_all()

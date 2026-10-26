@@ -50,6 +50,14 @@ class Settings:
         """Parent of per-project Hermes homes; each project's HERMES_HOME is <hermes_root>/<slug>."""
         return self.data_dir / "hermes"
 
+    def session_fernet(self):
+        """Fernet for Telegram user sessions at rest. A session string IS the account, so no key = no storage."""
+        key = os.environ.get("OLIAN_SESSION_KEY", "")
+        if not key:
+            raise RuntimeError("OLIAN_SESSION_KEY is not set (olian setup generates one): refusing to store Telegram sessions unencrypted")
+        from cryptography.fernet import Fernet
+        return Fernet(key.encode())
+
     def pii_salt(self) -> bytes:
         """Secret salt for pseudonymising author ids. From OLIAN_PII_SALT, else a generated file (0600) in the data dir.
         Losing it makes existing pseudonyms unlinkable (which is safe); leaking it weakens them."""
