@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
 
 from .app import App
 from .facade import Actor
@@ -44,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     t = sub.add_parser("token", help="issue an API token (scraper, script, MCP client)")
     t.add_argument("project"); t.add_argument("--label", required=True); t.add_argument("--role", default="manager")
     t.add_argument("--scopes", default="")
+    t.add_argument("--replace", action="store_true", help="invalidate older tokens with the same label (rotation)")
+    tr = sub.add_parser("token-revoke", help="invalidate all tokens with a label"); tr.add_argument("project"); tr.add_argument("label")
+    tl = sub.add_parser("tokens", help="list token labels (never the secrets)"); tl.add_argument("project")
     s = sub.add_parser("sender", help="register an outreach sender")
     s.add_argument("project"); s.add_argument("label"); s.add_argument("channel", choices=["whatsapp_cloud", "webhook", "dryrun"])
     s.add_argument("--config", default="{}"); s.add_argument("--cap", type=int, default=20)
@@ -57,8 +62,29 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--host"); r.add_argument("--port", type=int)
     r.add_argument("--start-agents", action="store_true", help="also start every project's Hermes gateway")
     sub.add_parser("tick", help="run one pass of background work")
+    sub.add_parser("setup", help="generate .env with fresh secrets (admin key, webhook secret, PII salt, backup key)")
+    mo = sub.add_parser("monitor", help="Telegram monitoring helpers")
+    mos = mo.add_subparsers(dest="msub", required=True)
+    mi = mos.add_parser("init", help="configure monitoring for a project and create a starter rule")
+    mi.add_argument("project"); mi.add_argument("--bot-token", default="", help="token of a DEDICATED monitoring bot (not the chat bot)")
+    mi.add_argument("--bot-token-env", default="", help="read the token from this environment variable instead")
+    mi.add_argument("--profile", default="", help="who counts as a good lead, in a sentence")
+    mi.add_argument("--topics", required=True, help="comma-separated topic phrases, e.g. 'вілл*,глемпінг*,villa*'")
+    mi.add_argument("--category", default="general"); mi.add_argument("--langs", default="uk,ru,en")
+    mi.add_argument("--mode", default="rules", choices=["rules", "hybrid", "llm"])
+    mi.add_argument("--author", default="hash", choices=["hash", "raw", "none"])
+    me_ = mos.add_parser("evaluate", help="precision/recall on a labelled JSON sample [{text, expected}]")
+    me_.add_argument("project"); me_.add_argument("samples")
+    bk = sub.add_parser("backup", help="consistent, encrypted snapshot of the database")
+    bk.add_argument("--out", default=""); bk.add_argument("--plain", action="store_true", help="allow an UNENCRYPTED backup")
+    rs = sub.add_parser("restore", help="restore a backup into a (new) data directory")
+    rs.add_argument("file"); rs.add_argument("--to", required=True)
 
     args = ap.parse_args(argv)
+    if args.cmd == "setup":
+        return setup_env()
+    if args.cmd == "restore":
+        return restore_backup(args.file, args.to)
     core = App()
 
     if args.cmd == "init":
@@ -101,7 +127,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "bind":
         core.projects.bind(args.project, args.platform, args.chat)
     elif args.cmd == "token":
-        print(core.projects.issue_token(args.project, args.label, args.role, args.scopes))
+        print(core.projects.issue_token(args.project, args.label, args.role, args.scopes, replace=args.replace))
+    elif args.cmd == "token-revoke":
+        print(f"revoked {core.projects.revoke_token(args.project, args.label)} token(s)")
+    elif args.cmd == "tokens":
+        for t in core.projects.list_tokens(args.project):
+            print(f"{t['label']:<20} {t['role']:<8} scopes={t['scopes'] or '*'}")
     elif args.cmd == "sender":
         core.outreach.add_sender(args.project, args.label, args.channel, json.loads(args.config), args.cap)
     elif args.cmd == "scraper":
@@ -112,6 +143,15 @@ def main(argv: list[str] | None = None) -> int:
         print(_j(core.facade.call(args.project, ADMIN, args.action, json.loads(args.args))))
     elif args.cmd == "tick":
         core.tick()
+    elif args.cmd == "monitor":
+        if args.msub == "init":
+            return monitor_init(core, args)
+        res = core.monitor.evaluate(args.project, json.load(open(args.samples)))
+        print(_j({k: v for k, v in res.items() if k != "mismatches"}))
+        for m in res["mismatches"][:20]:
+            print(f"  {'FN' if m['expected'] else 'FP'} {m['text'][:90]!r} -> {m['why'][:90]}")
+    elif args.cmd == "backup":
+        return backup(core, args.out, args.plain)
     elif args.cmd == "serve":
         import uvicorn
         from .api import create_app
@@ -119,6 +159,96 @@ def main(argv: list[str] | None = None) -> int:
             for p in core.projects.list():
                 core.projects.start(p["id"])
         uvicorn.run(create_app(core), host=args.host or core.s.host, port=args.port or core.s.port)
+    return 0
+
+
+def setup_env() -> int:
+    import secrets
+    from cryptography.fernet import Fernet
+    path = Path(".env")
+    if path.exists():
+        print(".env already exists; refusing to overwrite. Delete it first if you really want new secrets.")
+        return 1
+    lines = [f"OLIAN_API_KEY={secrets.token_urlsafe(32)}", f"OLIAN_WEBHOOK_SECRET={secrets.token_urlsafe(32)}",
+             f"OLIAN_PII_SALT={secrets.token_hex(32)}", f"OLIAN_BACKUP_KEY={Fernet.generate_key().decode()}",
+             "OLIAN_DATA_DIR=./data", "OLIAN_PORT_BASE=8700", "OLIAN_DEFAULT_PROVIDER=", "OLIAN_DEFAULT_MODEL=",
+             "WHATSAPP_CLOUD_TOKEN=", "WHATSAPP_VERIFY_TOKEN=", "WHATSAPP_APP_SECRET=", "OLIAN_NOTIFY_TELEGRAM_TOKEN="]
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o600)
+    print("wrote .env (0600) with fresh secrets. KEEP A COPY OF OLIAN_BACKUP_KEY AND OLIAN_PII_SALT somewhere safe:\n"
+          "without the backup key encrypted backups cannot be opened; losing the PII salt makes stored pseudonyms unlinkable.")
+    return 0
+
+
+def monitor_init(core: App, a) -> int:
+    from .presets import EXCLUDE, intent_phrases
+    mon = {"enabled": True, "mode": a.mode, "author": a.author, "profile": a.profile}
+    if a.bot_token_env:
+        mon["bot_token_env"] = a.bot_token_env
+    elif a.bot_token:
+        mon["bot_token"] = a.bot_token
+    core.projects.update_config(a.project, {"monitor": mon})
+    topics = [t.strip() for t in a.topics.split(",") if t.strip()]
+    rule = core.monitor.save_rule(a.project, {"name": f"{a.category}: topic + intent", "category": a.category, "phrases": topics,
+                                              "require_any": intent_phrases(a.langs.split(",")), "exclude": EXCLUDE})
+    print(f"monitoring enabled for {a.project}; starter rule #{rule['id']} created ({len(topics)} topic phrases, "
+          f"{len(rule['require_any'])} intent phrases). Next: add the bot to approved chats, then approve them as sources "
+          f"(panel /admin -> Джерела, or `olian do {a.project} monitor.sources.add '{{\"chat_ref\":\"-100…\"}}'`).")
+    return 0
+
+
+def backup(core: App, out: str, plain: bool) -> int:
+    import io, sqlite3, tarfile, tempfile, time as _t
+    key = os.environ.get("OLIAN_BACKUP_KEY", "")
+    if not key and not plain:
+        print("OLIAN_BACKUP_KEY is not set; refusing to write an unencrypted backup (use `olian setup`, or --plain).")
+        return 1
+    with tempfile.TemporaryDirectory() as td:
+        snap = Path(td) / "olian.db"
+        dst = sqlite3.connect(snap)
+        core.db._conn.backup(dst)  # consistent even while the service is writing
+        dst.close()
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(snap, arcname="olian.db")
+            salt = core.s.data_dir / ".pii_salt"
+            if salt.exists():
+                tar.add(salt, arcname=".pii_salt")
+        data = buf.getvalue()
+    if key:
+        from cryptography.fernet import Fernet
+        data = Fernet(key.encode()).encrypt(data)
+    name = out or f"backup-{_t.strftime('%Y%m%d-%H%M%S')}.tar.gz" + (".enc" if key else "")
+    Path(name).write_bytes(data)
+    Path(name).chmod(0o600)
+    print(f"wrote {name} ({len(data)} bytes, {'encrypted' if key else 'PLAIN'})")
+    return 0
+
+
+def restore_backup(file: str, to: str) -> int:
+    import io, tarfile
+    data = Path(file).read_bytes()
+    if file.endswith(".enc"):
+        key = os.environ.get("OLIAN_BACKUP_KEY", "")
+        if not key:
+            print("OLIAN_BACKUP_KEY is required to open an encrypted backup")
+            return 1
+        from cryptography.fernet import Fernet, InvalidToken
+        try:
+            data = Fernet(key.encode()).decrypt(data)
+        except InvalidToken:
+            print("wrong key or corrupted backup")
+            return 1
+    dest = Path(to)
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            if m.name not in ("olian.db", ".pii_salt"):
+                print(f"unexpected member {m.name!r}; aborting")
+                return 1
+        tar.extractall(dest, filter="data")
+    (dest / ".pii_salt").exists() and (dest / ".pii_salt").chmod(0o600)
+    print(f"restored into {dest} (set OLIAN_DATA_DIR={dest})")
     return 0
 
 

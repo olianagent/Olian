@@ -50,6 +50,20 @@ class Settings:
         """Parent of per-project Hermes homes; each project's HERMES_HOME is <hermes_root>/<slug>."""
         return self.data_dir / "hermes"
 
+    def pii_salt(self) -> bytes:
+        """Secret salt for pseudonymising author ids. From OLIAN_PII_SALT, else a generated file (0600) in the data dir.
+        Losing it makes existing pseudonyms unlinkable (which is safe); leaking it weakens them."""
+        env = os.environ.get("OLIAN_PII_SALT", "")
+        if env:
+            return env.encode()
+        path = self.data_dir / ".pii_salt"
+        if not path.exists():
+            import secrets
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(secrets.token_hex(32))
+            path.chmod(0o600)
+        return path.read_text().strip().encode()
+
     def ensure_dirs(self) -> None:
         for p in (self.data_dir, self.projects_dir, self.hermes_root):
             p.mkdir(parents=True, exist_ok=True)

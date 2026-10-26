@@ -54,6 +54,7 @@ class Projects:
             raise ValueError("project id: 2-39 chars, lowercase letters, digits, dashes")
         if self.db.one("SELECT 1 FROM projects WHERE id=?", (pid,)):
             raise ValueError(f"project {pid!r} already exists")
+        self.validate_cfg(cfg or {})
         self.db.x("INSERT INTO projects(id,name,goal,api_port,api_key,config,created_at) VALUES(?,?,?,?,?,?,?)",
                   (pid, name, goal, self._next_port(), secrets.token_urlsafe(24),
                    json.dumps(cfg or {}, ensure_ascii=False), time.time()))
@@ -80,9 +81,21 @@ class Projects:
                     return line.split("=", 1)[1].strip()
         return ""
 
+    @staticmethod
+    def validate_cfg(cfg: dict) -> None:
+        mon = cfg.get("monitor", {})
+        chat_tok = cfg.get("channels", {}).get("telegram", {}).get("bot_token")
+        if mon.get("bot_token") and mon.get("bot_token") == chat_tok:
+            raise ValueError("monitor.bot_token must differ from the chat bot token (two consumers of one getUpdates conflict)")
+        if mon.get("author", "hash") not in ("hash", "raw", "none"):
+            raise ValueError("monitor.author must be hash|raw|none")
+        if mon.get("mode", "rules") not in ("rules", "llm", "hybrid"):
+            raise ValueError("monitor.mode must be rules|llm|hybrid")
+
     def update_config(self, pid: str, patch: dict) -> dict:
         project = self.get(pid)
         cfg = _merge(project["cfg"], patch)
+        self.validate_cfg(cfg)
         self.db.x("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg, ensure_ascii=False), pid))
         return self.provision(pid)
 
@@ -160,6 +173,16 @@ class Projects:
         self.db.x("INSERT INTO tokens(hash,project_id,label,role,scopes,created_at) VALUES(?,?,?,?,?,?)",
                   (hash_token(token), pid, label, Role(role).value, scopes, time.time()))
         return token
+
+    def revoke_token(self, pid: str, label: str) -> int:
+        """Immediately invalidate every token with this label. The agent's own token is re-issued by provision()."""
+        n = self.db.one("SELECT COUNT(*) n FROM tokens WHERE project_id=? AND label=?", (pid, label))["n"]
+        self.db.x("DELETE FROM tokens WHERE project_id=? AND label=?", (pid, label))
+        return n
+
+    def list_tokens(self, pid: str) -> list[dict]:
+        """Labels, roles, scopes, age. Never the token itself (only a hash is stored)."""
+        return self.db.q("SELECT label, role, scopes, created_at FROM tokens WHERE project_id=? ORDER BY created_at", (pid,))
 
     def token_info(self, token: str) -> dict | None:
         return self.db.one("SELECT * FROM tokens WHERE hash=?", (hash_token(token),))

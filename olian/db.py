@@ -79,7 +79,8 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(SCHEMA)
+        from .migrations import apply
+        apply(self._conn, SCHEMA)
 
     def q(self, sql: str, args: Iterable[Any] = ()) -> list[dict]:
         with self._lock:

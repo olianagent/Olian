@@ -1,5 +1,5 @@
-"""Event inbox + rules. Scrapers, webhooks and the user's own monitors (e.g. a Telegram account farm) all
-POST events; rules turn matching events into leads (speed-to-lead), tasks or notifications."""
+"""Event inbox + rules. Scrapers, webhooks and external monitors all POST events; rules turn matching events into
+leads, tasks or notifications. A lead from a signal is for a HUMAN to act on: nothing here contacts anyone."""
 from __future__ import annotations
 
 import json
@@ -96,11 +96,14 @@ class Signals:
                 source=f"signal:{title}", data={"signal": _text(payload)[:500], "source": ev["source"]},
                 detected_at=float(payload.get("ts") or ev["created_at"]))
             stats["leads"] += 1
-            if rule.get("auto_draft", True) and lead["status"] == "new":
+            if lead["status"] == "new":  # a human decides how (and whether) to engage; see Outreach.contact_block
                 try:
-                    self.app.outreach.draft(pid, lead["id"], brief=f"Reacting to their message: {_text(payload)[:300]}")
-                except HermesError:
-                    pass  # lead stays 'new'; a manager can draft later
+                    if rule.get("auto_draft", False):
+                        self.app.outreach.draft(pid, lead["id"], brief=f"Reacting to their message: {_text(payload)[:300]}")
+                except (HermesError, ValueError):
+                    pass
+                self.app.notifier.send(pid, f"🔔 Сигнал «{title}» → лід #{lead['id']} ({lead['channel']}:{lead['address']}); "
+                                            f"автоконтакту немає, рішення за оператором.\n{_text(payload)[:300]}")
         elif action == "task":
             self.app.tasks.add(pid, f"{title}: {_text(payload)[:80]}", detail=json.dumps(payload, ensure_ascii=False)[:800],
                                executor=rule.get("executor", "human"), assignee=rule.get("assignee", ""))

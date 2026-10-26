@@ -6,7 +6,7 @@ import threading
 
 import httpx
 
-from .channels import ChannelError, Telegram
+from .channels import ChannelError, Telegram, TelegramError
 
 log = logging.getLogger("olian.telegram")
 
@@ -32,6 +32,11 @@ class TelegramBridge:
                 for u in api.updates(offset):
                     offset = u["update_id"] + 1
                     self.handle_update(pid, api, u)
+            except TelegramError as e:
+                log.warning("telegram %s: %s", pid, e)
+                if e.is_auth:  # a rejected token will not become valid by retrying: stop this bot's loop
+                    return
+                self.app._stop.wait(max(e.retry_after, 1) if e.is_rate_limit else 30 if e.is_conflict else 5)
             except (ChannelError, httpx.HTTPError) as e:
                 log.warning("telegram %s: %s", pid, e)
                 self.app._stop.wait(5)

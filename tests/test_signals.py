@@ -51,21 +51,27 @@ def test_due_scrapers_only(core, proj, http):
     assert core.scrapers.run_due(proj, now=10**10 + 5) == []
 
 
-def test_rule_turns_message_into_lead_and_draft_fast(core, proj, agent):
+def test_rule_turns_message_into_lead_but_never_auto_contacts(core, proj, agent, http):
     core.projects.update_config(proj, {"signals": {"rules": [
         {"name": "bali-stay", "keywords": ["glamping", "villa"], "exclude": ["sell"], "action": "lead",
-         "channel": "telegram", "address_field": "user.username", "name_field": "user.name", "ai_qualify": True}]}})
+         "channel": "telegram", "address_field": "user.username", "name_field": "user.name", "ai_qualify": True,
+         "auto_draft": True}]}})
     core.signals.ingest(proj, "monitor:tg", "message", {"text": "Any glamping in Bali for 5?", "user": {"username": "@ann", "name": "Ann"}})
     core.signals.ingest(proj, "monitor:tg", "message", {"text": "I want to sell my villa", "user": {"username": "@bob"}})
     core.signals.ingest(proj, "monitor:tg", "message", {"text": "weather is nice", "user": {"username": "@cat"}})
-    agent.script = [json.dumps({"qualified": True, "reason": "asks for stay"}), "Hi Ann! We have glamping near Ubud."]
+    agent.script = [json.dumps({"qualified": True, "reason": "asks for stay"})]
     stats = core.signals.process(proj)
-    assert stats == {"events": 3, "leads": 1, "tasks": 0, "notified": 0}
+    assert stats["events"] == 3 and stats["leads"] == 1
     ann = core.outreach.lead_by_addr(proj, "telegram", "@ann")
-    assert ann["name"] == "Ann" and ann["source"] == "signal:bali-stay"
-    assert core.outreach.outbox(proj)[0]["body"].startswith("Hi Ann")      # a draft already waits for approval
+    assert ann["name"] == "Ann" and ann["source"] == "signal:bali-stay" and ann["status"] == "new"
+    assert core.outreach.outbox(proj) == []                                  # even with auto_draft: no draft, no DM (CON-1)
+    assert http.sent_to("api.telegram.org")                                  # but the operators are told
     assert core.outreach.lead_by_addr(proj, "telegram", "@bob") is None     # excluded
     assert core.signals.process(proj)["events"] == 0                        # processed once only
+    with __import__("pytest").raises(ValueError, match="legal basis"):
+        core.outreach.compose(proj, ann["id"], "hello")
+    core.outreach.set_consent(proj, ann["id"], "Ann asked in the group to be contacted by DM")
+    assert core.outreach.compose(proj, ann["id"], "hello Ann")["status"] == "draft"
 
 
 def test_ai_qualify_rejection_and_agent_outage_retries(core, proj, agent):

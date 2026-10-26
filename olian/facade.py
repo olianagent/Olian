@@ -160,7 +160,7 @@ class Facade:
 def _redact(obj):
     """Secrets never reach the audit log, at any nesting depth."""
     if isinstance(obj, dict):
-        return {k: ("***" if any(s in str(k).lower() for s in ("token", "secret", "password", "key", "authorization"))
+        return {k: ("***" if any(s in str(k).lower() for s in ("token", "secret", "password", "key", "authorization", "author"))
                     else _redact(v)) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_redact(v) for v in obj]

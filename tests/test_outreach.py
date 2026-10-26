@@ -151,3 +151,30 @@ def test_warm_contacts_get_checkin_drafts_and_next_touch(core, proj, agent, noon
 def test_funnel(core, proj):
     lead(core, proj); core.outreach.add_lead(proj, "telegram", "@a")
     assert core.outreach.funnel(proj)["leads"] == {"new": 2}
+
+
+def test_authors_of_monitored_posts_cannot_be_contacted_without_basis(core, proj, noon):
+    sender(core, proj)
+    for src in ("signal:x", "monitor:y"):
+        l = core.outreach.add_lead(proj, "telegram", "@a" + src[:3], source=src)
+        with pytest.raises(ValueError, match="legal basis"):
+            core.outreach.compose(proj, l["id"], "hi")
+    with pytest.raises(ValueError, match="describe the basis"):
+        core.outreach.set_consent(proj, l["id"], "ok")
+    core.outreach.set_consent(proj, l["id"], "asked to be contacted in thread")
+    assert json.loads(core.outreach.lead(proj, l["id"])["data"])["consent_basis"]
+    m = core.outreach.compose(proj, l["id"], "hi", approve=True)
+    # a queued message is re-checked at send time: revoking the basis cancels it
+    core.db.x("UPDATE leads SET consent=0 WHERE id=?", (l["id"],))
+    assert core.outreach.send_due(proj, noon)["cancelled"] == 1
+    assert "legal basis" in core.outreach.message(proj, m["id"])["error"]
+
+
+def test_telegram_has_no_account_rotation_or_failover(core, proj, noon):
+    core.outreach.add_sender(proj, "a", "dryrun", {}, 1)
+    core.outreach.add_sender(proj, "b", "dryrun", {}, 50)
+    ids = [core.outreach.compose(proj, core.outreach.add_lead(proj, "telegram", f"@u{i}")["id"], "x", approve=True)["id"]
+           for i in range(3)]
+    r = core.outreach.send_due(proj, noon)
+    assert r["sent"] == 1 and "no sender with capacity" in r["skipped"]        # 'b' is NOT used when 'a' hits its cap
+    assert {core.outreach.message(proj, i)["sender"] for i in ids if core.outreach.message(proj, i)["status"] == "sent"} == {"a"}

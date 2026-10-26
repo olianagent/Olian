@@ -6,6 +6,9 @@ services:
         HERMES_REF: main          # pin a tag/commit for reproducible builds
     restart: unless-stopped
     env_file: .env
+    read_only: false
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     ports:
       - "127.0.0.1:8600:8600"     # put a TLS reverse proxy in front for the WhatsApp/webhook endpoints
     volumes:

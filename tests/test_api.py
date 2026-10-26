@@ -156,3 +156,53 @@ def test_chat_endpoint_and_binding(client, core, proj):
     client.post("/projects/alpha/bindings", headers=ADM, json={"platform": "telegram", "chat_id": "-5"})
     r = client.post("/chat", headers=ADM, json={"platform": "telegram", "chat_id": "-5", "user_id": "2", "text": "/status"})
     assert "Alpha Villas" in r.json()["reply"]
+
+
+# ----------------------------------------------------------------------------- monitoring panel & endpoints
+def test_panel_is_served_with_strict_csp_and_no_unsafe_dom_sinks(client):
+    for path, kind in (("/admin", "text/html"), ("/admin/app.js", "javascript"), ("/admin/app.css", "text/css")):
+        r = client.get(path)
+        assert r.status_code == 200 and kind in r.headers["content-type"]
+        csp = r.headers["content-security-policy"]
+        assert "default-src 'none'" in csp and "script-src 'self'" in csp and "unsafe-inline" not in csp and "frame-ancestors 'none'" in csp
+        assert r.headers["x-content-type-options"] == "nosniff" and r.headers["cache-control"] == "no-store"
+    js = client.get("/admin/app.js").text
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
+        assert sink not in js, sink
+    assert "<script>" not in client.get("/admin").text                      # no inline script: CSP would block it anyway
+
+
+def test_whoami_and_admin_key_on_a_named_project(client, core, proj):
+    r = client.get("/p/whoami", headers=tok(core, proj, "op", "manager"))
+    assert r.json() == {"project": "alpha", "name": "Alpha Villas", "role": "manager", "label": "op", "scopes": ""}
+    adm = {"Authorization": "Bearer admin-key", "X-Olian-Project": "alpha"}
+    assert client.get("/p/whoami", headers=adm).json()["role"] == "admin"
+    assert client.get("/p/whoami", headers={"Authorization": "Bearer admin-key"}).status_code == 401      # needs a project
+    assert client.get("/p/whoami", headers={**adm, "X-Olian-Project": "ghost"}).status_code == 404
+    assert client.get("/p/whoami", headers={"Authorization": "Bearer wrong", "X-Olian-Project": "alpha"}).status_code == 401
+
+
+def test_csv_endpoint_respects_roles_and_is_formula_safe(client, core, proj):
+    core.projects.update_config(proj, {"monitor": {"enabled": True}})
+    core.monitor.save_rule(proj, {"name": "r", "phrases": ["вілл*"]})
+    core.monitor.add_source(proj, "-100111", title="S")
+    core.monitor.ingest_message(proj, "-100111", 1, "=2+2 шукаю віллу, підкажіть будь ласка скільки коштує?", author_id=1)
+    core.monitor.process_pending(proj)
+    r = client.get("/p/monitor/export.csv?status=new", headers=tok(core, proj, "op", "manager"))
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv") and "attachment" in r.headers["content-disposition"]
+    assert "'=2+2" in r.text and ",=2+2" not in r.text
+    assert client.get("/p/monitor/export.csv", headers=tok(core, proj, "v", "viewer")).status_code == 403
+    assert client.get("/p/monitor/export.csv").status_code == 401
+
+
+def test_monitor_actions_over_rest_follow_roles(client, core, proj):
+    admin, mgr, view = tok(core, proj, "a", "admin"), tok(core, proj, "m", "manager"), tok(core, proj, "v", "viewer")
+    rule = {"rule": {"name": "n", "phrases": ["x"]}}
+    assert client.post("/p/actions/monitor.rules.save", headers=admin, json=rule).status_code == 200
+    assert client.post("/p/actions/monitor.rules.save", headers=mgr, json=rule).status_code == 403
+    assert client.post("/p/actions/monitor.rules.list", headers=view, json={}).status_code == 200
+    assert client.post("/p/actions/monitor.sources.add", headers=admin, json={"chat_ref": "-1"}).status_code == 200
+    assert client.post("/p/actions/monitor.sources.add", headers=admin, json={"chat_ref": "-1"}).status_code == 400   # duplicate
+    assert client.post("/p/actions/monitor.report", headers=view, json={"days": 7}).json()["result"]["received"] == 0
+    agent_h = {"Authorization": "Bearer " + core.projects._current_agent_token(proj)}
+    assert client.post("/p/actions/monitor.leads.list", headers=agent_h, json={}).status_code == 403   # agent is kept out

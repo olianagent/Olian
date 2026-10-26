@@ -124,6 +124,21 @@ def register_all(f: Facade) -> None:
         app.outreach.add_sender(pid, label, channel, config, daily_cap)
         return {"ok": True}
 
+    @f.register("outreach.senders", "List senders with status (active|tripped), caps and usage; secrets are masked.", A,
+                agent_ok=False)
+    def outreach_senders(app, pid, actor):
+        return app.outreach.senders_public(pid)
+
+    @f.register("outreach.reset_sender", "Re-enable a sender stopped by the circuit breaker, after the cause was investigated.",
+                A, {"label": STR}, ["label"], agent_ok=False)
+    def outreach_reset(app, pid, actor, label):
+        return app.outreach.reset_sender(pid, label)
+
+    @f.register("outreach.stop", "Put a person on the project stop-list (final, applies to every channel).", M,
+                {"channel": STR, "address": STR}, ["channel", "address"], agent_ok=False)
+    def outreach_stop(app, pid, actor, channel, address):
+        return app.outreach.stop(pid, channel, address)
+
     @f.register("outreach.reply", "Record an inbound reply from a lead (used by channel bridges).", M,
                 {"channel": STR, "address": STR, "text": STR, "name": STR}, ["channel", "address", "text"], agent_ok=False)
     def outreach_reply(app, pid, actor, channel, address, text, name=""):
@@ -167,6 +182,134 @@ def register_all(f: Facade) -> None:
                 agent_ok=False)
     def chat_ask(app, pid, actor, text):
         return {"reply": app.agent_chat(pid, text, session=f"chat-{actor.label}", actor=actor)}
+
+
+    # ----------------------------------------------------------------- consent (contact module guard)
+    @f.register("leads.set_consent", "Record the legal basis for contacting a lead (required before any message to the "
+                "author of a monitored post). Describe it, e.g. 'asked to be contacted in the group'.", M,
+                {"id": INT, "basis": STR}, ["id", "basis"], agent_ok=False)
+    def leads_set_consent(app, pid, actor, id, basis):
+        return app.outreach.set_consent(pid, id, f"{basis} (recorded by {actor.label})")
+
+    _register_monitor(f)
+
+
+def _register_monitor(f: Facade) -> None:
+    """Telegram monitoring (docs/TZ-telegram-monitoring.md). Closed to the agent: the data is untrusted text (SEC-9)."""
+    OBJ = {"type": "object"}
+
+    @f.register("monitor.sources.list", "List monitored sources with status, last success, counters.", V, agent_ok=False)
+    def src_list(app, pid, actor):
+        return app.monitor.sources(pid)
+
+    @f.register("monitor.sources.candidates", "Chats the bot is in but that are not approved sources.", A, agent_ok=False)
+    def src_cand(app, pid, actor):
+        return app.monitor.candidates(pid)
+
+    @f.register("monitor.sources.add", "Add an approved source (Telegram chat id). ingest: bot (default) | push.", A,
+                {"chat_ref": STR, "title": STR, "username": STR, "kind": STR, "ingest": STR}, ["chat_ref"], agent_ok=False)
+    def src_add(app, pid, actor, chat_ref, title="", username="", kind="", ingest="bot"):
+        return app.monitor.add_source(pid, chat_ref, title, username, kind, ingest)
+
+    @f.register("monitor.sources.update", "Pause/resume a source (status: active|paused) or rename it.", A,
+                {"id": INT, "status": STR, "title": STR}, ["id"], agent_ok=False)
+    def src_update(app, pid, actor, id, status=None, title=None):
+        return app.monitor.update_source(pid, id, status, title)
+
+    @f.register("monitor.sources.remove", "Remove a source and its retained messages (leads are kept).", A, {"id": INT}, ["id"],
+                agent_ok=False)
+    def src_remove(app, pid, actor, id):
+        app.monitor.remove_source(pid, id)
+        return {"ok": True}
+
+    @f.register("monitor.source_status", "Report a source as unavailable/auth_error with a reason (for push clients).", M,
+                {"id": INT, "status": STR, "reason": STR}, ["id", "status"], agent_ok=False)
+    def src_status(app, pid, actor, id, status, reason=""):
+        return app.monitor.set_source_status(pid, id, status, reason)
+
+    @f.register("monitor.rules.list", "List keyword rules.", V, agent_ok=False)
+    def rules_list(app, pid, actor):
+        return app.monitor.rules(pid)
+
+    @f.register("monitor.rules.save", "Create or update a rule: {id?, name, category, phrases[], all_of[], exclude[], "
+                "min_hits, weight, enabled}. Phrases support prefix wildcard 'куп*'.", A, {"rule": OBJ}, ["rule"], agent_ok=False)
+    def rules_save(app, pid, actor, rule):
+        return app.monitor.save_rule(pid, rule)
+
+    @f.register("monitor.rules.delete", "Delete a rule.", A, {"id": INT}, ["id"], agent_ok=False)
+    def rules_delete(app, pid, actor, id):
+        app.monitor.delete_rule(pid, id)
+        return {"ok": True}
+
+    @f.register("monitor.rules.test", "Dry-run a rule over retained messages (nothing is written).", M,
+                {"rule": OBJ, "limit": INT}, ["rule"], agent_ok=False)
+    def rules_test(app, pid, actor, rule, limit=20):
+        return app.monitor.test_rule(pid, rule, limit)
+
+    @f.register("monitor.ingest", "Push one message from an authorised operator client (channel B; disabled by default).", M,
+                {"chat_ref": STR, "message_id": INT, "text": STR, "date": {"type": "number"}, "author_id": STR},
+                ["chat_ref", "message_id", "text"], agent_ok=False)
+    def ingest(app, pid, actor, chat_ref, message_id, text, date=None, author_id=None):
+        return app.monitor.ingest_push(pid, chat_ref, message_id, text, date, author_id)
+
+    @f.register("monitor.collect", "Poll the Bot API once now.", M, agent_ok=False)
+    def collect(app, pid, actor):
+        return app.monitor.collect(pid)
+
+    @f.register("monitor.process", "Run level-2 qualification on queued messages now.", M, {"limit": INT}, agent_ok=False)
+    def process(app, pid, actor, limit=50):
+        return app.monitor.process_pending(pid, limit)
+
+    @f.register("monitor.leads.list", "List leads. Filters: status, category, source_id, q (text), since (epoch).", V,
+                {"status": STR, "category": STR, "source_id": INT, "q": STR, "since": {"type": "number"}, "limit": INT,
+                 "offset": INT}, agent_ok=False)
+    def leads_list_(app, pid, actor, status=None, category=None, source_id=None, q=None, since=None, limit=100, offset=0):
+        return app.monitor.leads(pid, status, category, source_id, q, since, limit, offset)
+
+    @f.register("monitor.leads.get", "Lead with hit history, status history and the allowed contact ways.", V, {"id": INT},
+                ["id"], agent_ok=False)
+    def leads_get(app, pid, actor, id):
+        return app.monitor.lead_detail(pid, id)
+
+    @f.register("monitor.leads.set_status", "Review a lead: new|review|relevant|irrelevant|processed|excluded, with a note "
+                "and optional outcome of the manual handling.", M, {"id": INT, "status": STR, "note": STR, "outcome": STR},
+                ["id", "status"], agent_ok=False)
+    def leads_status(app, pid, actor, id, status, note="", outcome=None):
+        return app.monitor.set_status(pid, id, status, actor.label, note, outcome)
+
+    @f.register("monitor.leads.note", "Add an operator note to a lead.", M, {"id": INT, "note": STR}, ["id", "note"],
+                agent_ok=False)
+    def leads_note(app, pid, actor, id, note):
+        return app.monitor.add_note(pid, id, note, actor.label)
+
+    @f.register("monitor.leads.delete", "Delete a lead and its history (data erasure).", A, {"id": INT}, ["id"], agent_ok=False)
+    def leads_delete(app, pid, actor, id):
+        app.monitor.delete_lead(pid, id)
+        return {"ok": True}
+
+    @f.register("monitor.report", "Funnel report for the last N days (received, matched, qualified, duplicates, errors, "
+                "confirmed %, top sources/rules, daily series).", V, {"days": INT}, agent_ok=False)
+    def report(app, pid, actor, days=30):
+        return app.monitor.report(pid, days)
+
+    @f.register("monitor.export", "Export leads as CSV text (formula-safe).", M, {"status": STR, "category": STR, "since": {"type": "number"}},
+                agent_ok=False)
+    def export(app, pid, actor, status=None, category=None, since=None):
+        return {"csv": app.monitor.export_csv(pid, status, category, since)}
+
+    @f.register("monitor.evaluate", "Precision/recall on a labelled sample [{text, expected: relevant|irrelevant}].", M,
+                {"samples": {"type": "array", "items": OBJ}}, ["samples"], agent_ok=False)
+    def evaluate(app, pid, actor, samples):
+        return app.monitor.evaluate(pid, samples)
+
+    @f.register("monitor.purge", "Apply retention now (delete expired messages and leads).", A, agent_ok=False)
+    def purge(app, pid, actor):
+        return app.monitor.purge(pid)
+
+    @f.register("monitor.erase_author", "Erase everything stored about a Telegram author id (GDPR erasure).", A,
+                {"author_id": STR}, ["author_id"], agent_ok=False)
+    def erase(app, pid, actor, author_id):
+        return app.monitor.erase_author(pid, author_id)
 
 
 __all__ = ["register_all", "format_task"]

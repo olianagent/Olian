@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Callable
@@ -12,6 +13,7 @@ from .config import Settings
 from .db import DB
 from .facade import Actor, Facade
 from .notify import Notifier
+from .monitor import Monitor
 from .outreach import Outreach
 from .projects import Projects
 from .rbac import Role
@@ -20,6 +22,37 @@ from .signals import Signals
 from .tasks import Tasks
 
 log = logging.getLogger("olian")
+
+
+_PATTERNS = [(re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}"), "bot***"),
+             (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer ***"),
+             (re.compile(r"olp_[A-Za-z0-9_-]{16,}"), "olp_***")]
+
+
+def redact(text: str) -> str:
+    """Telegram bot tokens and bearer/API tokens must never reach the logs."""
+    for pat, rep in _PATTERNS:
+        text = pat.sub(rep, text)
+    return text
+
+
+def install_log_redaction() -> None:
+    """Wrap the record factory so EVERY record (any logger, any handler) is redacted before formatting."""
+    old = logging.getLogRecordFactory()
+    if getattr(old, "_olian_redacting", False):
+        return
+
+    def factory(*a, **kw):
+        rec = old(*a, **kw)
+        try:
+            rec.msg, rec.args = redact(rec.getMessage()), ()
+        except Exception:  # noqa: BLE001  (never break logging)
+            pass
+        return rec
+    factory._olian_redacting = True
+    logging.setLogRecordFactory(factory)
+
+
 SYSTEM = Actor("system", Role.MANAGER)
 
 
@@ -27,6 +60,7 @@ class App:
     def __init__(self, settings: Settings | None = None, http=None):
         self.s = settings or Settings()
         self.s.ensure_dirs()
+        install_log_redaction()
         self.db = DB(self.s.db_path)
         self.runtime = hermes.Runtime(self.s)
         self.projects = Projects(self.db, self.s, self.runtime)
@@ -38,6 +72,7 @@ class App:
         self.outreach = Outreach(self, **kw)
         self.scrapers = Scrapers(self, **kw)
         self.signals = Signals(self)
+        self.monitor = Monitor(self, **kw)
         from .chat import Chat  # late: chat imports facade/actions
         self.chat = Chat(self)
         self.client_factory: Callable[[dict], hermes.Client] = lambda project: hermes.Client(
@@ -60,19 +95,31 @@ class App:
                                ("signals", lambda: self.signals.process(pid)),
                                ("stale", lambda: self.outreach.sweep_stale(pid)),
                                ("touches", lambda: self.outreach.touch_plan(pid)),
-                               ("send", lambda: self.outreach.send_due(pid))):
+                               ("send", lambda: self.outreach.send_due(pid)),
+                               ("monitor", lambda: self.monitor.maintenance(pid))):
                 try:
                     step()
                 except Exception:  # noqa: BLE001
                     log.exception("tick %s/%s failed", pid, name)
 
-    def start_workers(self, interval: float = 30) -> None:
+    def start_workers(self, interval: float = 30, poll_interval: float = 5) -> None:
         def loop():
             while not self._stop.wait(interval):
                 self.tick()
         t = threading.Thread(target=loop, name="olian-worker", daemon=True)
         t.start()
         self._threads.append(t)
+
+        def monitor_loop():  # near-real-time: short polls, errors never kill the loop
+            while not self._stop.wait(poll_interval):
+                for p in self.projects.list():
+                    try:
+                        self.monitor.poll(p["id"])
+                    except Exception:  # noqa: BLE001
+                        log.exception("monitor poll %s failed", p["id"])
+        m = threading.Thread(target=monitor_loop, name="olian-monitor", daemon=True)
+        m.start()
+        self._threads.append(m)
         from .bridge import TelegramBridge
         self.telegram = TelegramBridge(self)
         self._threads += self.telegram.start()

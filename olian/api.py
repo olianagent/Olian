@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -58,8 +59,12 @@ def create_app(core: App | None = None, workers: bool | None = None) -> FastAPI:
         if not hmac.compare_digest(bearer(authorization, x_olian_key), key):
             raise HTTPException(401, "bad admin key")
 
-    def principal(authorization: str | None = Header(None), x_olian_key: str | None = Header(None)):
+    def principal(authorization: str | None = Header(None), x_olian_key: str | None = Header(None),
+                  x_olian_project: str | None = Header(None)):
         tok = bearer(authorization, x_olian_key)
+        if tok and core.s.api_key and x_olian_project and hmac.compare_digest(tok, core.s.api_key):
+            core.projects.get(x_olian_project)  # the admin key may act on a project it names, as admin
+            return x_olian_project, Actor("admin-ui", Role.ADMIN), False
         info = core.projects.token_info(tok) if tok else None
         if not info:
             raise HTTPException(401, "bad token")
@@ -81,6 +86,29 @@ def create_app(core: App | None = None, workers: bool | None = None) -> FastAPI:
     @api.exception_handler(HermesError)
     async def _agent(_, e):
         return JSONResponse({"error": str(e)}, 502)
+
+    # ------------------------------------------------------------------ admin panel (static, strict CSP)
+    static = Path(__file__).parent / "static"
+    PANEL_HEADERS = {
+        "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+                                   "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
+        "X-Frame-Options": "DENY"}
+
+    def asset(name: str, media: str):
+        return Response((static / name).read_bytes(), media_type=media, headers=PANEL_HEADERS)
+
+    @api.get("/admin", include_in_schema=False)
+    def panel():
+        return asset("admin.html", "text/html; charset=utf-8")
+
+    @api.get("/admin/app.js", include_in_schema=False)
+    def panel_js():
+        return asset("admin.js", "text/javascript; charset=utf-8")
+
+    @api.get("/admin/app.css", include_in_schema=False)
+    def panel_css():
+        return asset("admin.css", "text/css; charset=utf-8")
 
     @api.get("/health")
     def health():
@@ -135,6 +163,16 @@ def create_app(core: App | None = None, workers: bool | None = None) -> FastAPI:
         core.projects.get(pid)
         return {"token": core.projects.issue_token(pid, body["label"], body.get("role", "manager"), body.get("scopes", ""))}
 
+    @api.get("/projects/{pid}/tokens", dependencies=[Depends(admin)])
+    def list_tokens(pid: str):
+        core.projects.get(pid)
+        return core.projects.list_tokens(pid)
+
+    @api.delete("/projects/{pid}/tokens/{label}", dependencies=[Depends(admin)])
+    def revoke_token(pid: str, label: str):
+        core.projects.get(pid)
+        return {"revoked": core.projects.revoke_token(pid, label)}
+
     @api.post("/chat", dependencies=[Depends(admin)])
     def chat(body: dict):
         return {"reply": core.chat.handle(body.get("platform", "api"), str(body.get("chat_id", "")), str(body["user_id"]),
@@ -156,6 +194,20 @@ def create_app(core: App | None = None, workers: bool | None = None) -> FastAPI:
     def call_action(name: str, body: dict | None = None, pr=Depends(principal)):
         pid, actor, via_agent = pr
         return {"result": core.facade.call(pid, actor, name, body or {}, via_agent=via_agent)}
+
+    @api.get("/p/whoami")
+    def whoami(pr=Depends(principal)):
+        pid, actor, _ = pr
+        return {"project": pid, "name": core.projects.get(pid)["name"], "role": actor.role.value, "label": actor.label,
+                "scopes": actor.scopes}
+
+    @api.get("/p/monitor/export.csv")
+    def export_csv(status: str | None = None, category: str | None = None, pr=Depends(principal)):
+        pid, actor, via_agent = pr
+        out = core.facade.call(pid, actor, "monitor.export", {k: v for k, v in (("status", status), ("category", category)) if v},
+                               via_agent)
+        return Response(out["csv"], media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="leads-{pid}.csv"', "Cache-Control": "no-store"})
 
     @api.post("/ingest")
     def ingest(body: dict, pr=Depends(principal)):

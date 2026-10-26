@@ -16,4 +16,5 @@ USER olian
 ENV OLIAN_DATA_DIR=/data OLIAN_HOST=0.0.0.0 OLIAN_HERMES_BIN=hermes HOME=/data/home
 VOLUME /data
 EXPOSE 8600
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8600/health', timeout=4).status == 200 else 1)"
 CMD ["olian", "serve", "--start-agents"]

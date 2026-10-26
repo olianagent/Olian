@@ -22,8 +22,17 @@ DEFAULT_POLICY = {
     "window": {"start": 9, "end": 20, "utc_offset": 0},
     "min_interval_seconds": 45,
     "max_lead_age_minutes": 0,  # speed-to-lead: a 'new' lead older than this is stale (0 = off)
-    "stop_words": ["stop", "unsubscribe", "отписаться", "відписатися", "не пишіть", "не пишите", "стоп"],
+    "stop_words": ["stop", "unsubscribe", "отписаться", "відписатися", "не пишіть", "не пишите", "стоп", "odhlásit"],
+    # --- built-in safeguards (docs/TELEGRAM-LIMITS.md): stop early, before a platform restricts anything
+    "max_per_lead": 3,            # at most this many messages to one person unless they reply
+    "min_gap_hours": 72,          # minimum gap between messages to one person unless they reply
+    "daily_cap_total": 50,        # all senders together, per project per day
+    "footer": "Щоб відмовитись від повідомлень, відповідайте STOP.",  # appended to the FIRST message to a person
+    "complaint_words": ["spam", "спам", "report", "скарг", "жалоб", "заблок", "blocked", "nahlásit"],
+    "breaker": {"consecutive_failures": 3, "complaints": 3, "optout_rate": 0.25, "min_sent_for_rate": 10, "window_days": 7},
 }
+LIMIT_MARKERS = ("peer_flood", "flood", "too many", "spam", "restricted", "banned", "blocked", "rate limit", "429",
+                 "131048", "131056", "130429", "368")
 POSITIVE = ("yes", "interested", "tell me more", "call me", "price", "how much", "да", "так", "цікаво", "интересно",
             "сколько", "скільки", "давайте", "ок")
 NEGATIVE = ("no thanks", "not interested", "не цікаво", "не интересно", "нет", "ні")
@@ -54,6 +63,7 @@ class Outreach:
         cfg = self.app.projects.get(pid)["cfg"].get("outreach", {})
         pol = {**DEFAULT_POLICY, **cfg}
         pol["window"] = {**DEFAULT_POLICY["window"], **cfg.get("window", {})}
+        pol["breaker"] = {**DEFAULT_POLICY["breaker"], **cfg.get("breaker", {})}
         return pol
 
     # ---- leads
@@ -66,7 +76,11 @@ class Outreach:
                   "created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                   (pid, channel, address, name, source, json.dumps(data or {}, ensure_ascii=False), warmth,
                    next_touch, detected_at or _now(), _now()))
-        return self.lead_by_addr(pid, channel, address)
+        lead = self.lead_by_addr(pid, channel, address)
+        if lead["status"] == "new" and self.stoplisted(pid, address, lead["id"]):
+            self.db.x("UPDATE leads SET status='opted_out' WHERE id=?", (lead["id"],))
+            lead = self.lead_by_addr(pid, channel, address)
+        return lead
 
     def lead_by_addr(self, pid: str, channel: str, address: str) -> dict | None:
         address = digits(address) if channel == "whatsapp" else address.strip()
@@ -109,6 +123,48 @@ class Outreach:
             r["config"] = json.loads(r["config"] or "{}")
         return rows
 
+    def senders_public(self, pid: str) -> list[dict]:
+        out = []
+        for r in self.senders(pid):
+            r["config"] = {k: ("***" if any(w in k.lower() for w in ("token", "secret", "key", "authorization")) else v)
+                           for k, v in r["config"].items() if k != "headers"}
+            out.append(r)
+        return out
+
+    def reset_sender(self, pid: str, label: str) -> dict:
+        if not self.db.one("SELECT 1 FROM senders WHERE project_id=? AND label=?", (pid, label)):
+            raise ValueError(f"sender {label!r} not found")
+        self.db.x("UPDATE senders SET status='active', status_reason='', fail_streak=0 WHERE project_id=? AND label=?", (pid, label))
+        return next(x for x in self.senders_public(pid) if x["label"] == label)
+
+    def trip(self, pid: str, reason: str, label: str | None = None) -> None:
+        """Circuit breaker (TZ CON-6): stop sending. Only an admin may re-enable; no failover to another account."""
+        sql = "UPDATE senders SET status='tripped', status_reason=? WHERE project_id=? AND status='active'"
+        args: list = [reason[:300], pid]
+        if label:
+            sql += " AND label=?"
+            args.append(label)
+        self.db.x(sql, args)
+        self.db.add_event(pid, "outreach", "breaker", {"reason": reason[:300], "sender": label or "all"})
+        self.app.notifier.send(pid, f"⛔ Аутріч зупинено ({label or 'усі відправники'}): {reason[:200]}\n"
+                                    "Причину треба з'ясувати; увімкнути може лише admin (outreach.reset_sender).", min_role="admin")
+
+    def check_health(self, pid: str, now: float | None = None) -> str | None:
+        """Trip all senders when complaints or opt-outs pile up (complaints are what actually get accounts restricted)."""
+        now, br = now or _now(), self.policy(pid)["breaker"]
+        since = now - br["window_days"] * 86400
+        complaints = self.db.one("SELECT COUNT(*) n FROM events WHERE project_id=? AND kind='complaint' AND created_at>=?", (pid, since))["n"]
+        sent = self.db.one("SELECT COUNT(*) n FROM messages WHERE project_id=? AND direction='out' AND status='sent' AND sent_at>=?", (pid, since))["n"]
+        optouts = self.db.one("SELECT COUNT(*) n FROM events WHERE project_id=? AND kind='optout' AND created_at>=?", (pid, since))["n"]
+        reason = None
+        if complaints >= br["complaints"]:
+            reason = f"{complaints} complaints in {br['window_days']} days"
+        elif sent >= br["min_sent_for_rate"] and optouts / sent >= br["optout_rate"]:
+            reason = f"opt-out rate {optouts}/{sent} in {br['window_days']} days"
+        if reason and any(x["status"] == "active" for x in self.senders(pid)):
+            self.trip(pid, reason)
+        return reason
+
     @staticmethod
     def _serves(sender: dict, channel: str) -> bool:
         if sender["channel"] == "whatsapp_cloud":
@@ -116,6 +172,41 @@ class Outreach:
         if sender["channel"] == "webhook":
             return channel in sender["config"].get("serves", ["telegram", "whatsapp", "email"])
         return True  # dryrun
+
+    # ---- contact guard (TZ CON-1/CON-2): authors of monitored posts are never contacted without a recorded basis
+    COLD_SOURCES = ("signal:", "monitor:")
+
+    def stoplisted(self, pid: str, address: str, exclude_id: int = 0) -> bool:
+        return bool(self.db.one("SELECT 1 FROM leads WHERE project_id=? AND address=? AND status='opted_out' AND id!=?",
+                                (pid, address, exclude_id)))
+
+    def stop(self, pid: str, channel: str, address: str) -> dict:
+        """Put a person on the project stop-list (they asked not to be contacted). Final; applies to every channel."""
+        lead = self.add_lead(pid, channel, address, source="stoplist")
+        self.db.x("UPDATE leads SET status='opted_out' WHERE id=?", (lead["id"],))
+        self.db.x("UPDATE messages SET status='cancelled', error='stop-list' WHERE lead_id=? AND status IN ('draft','approved')",
+                  (lead["id"],))
+        return self.lead(pid, lead["id"])
+
+    def contact_block(self, lead: dict) -> str | None:
+        if lead.get("status") == "opted_out" or self.stoplisted(lead["project_id"], lead["address"], lead["id"]):
+            return "the person is on the stop-list"
+        if lead.get("consent"):
+            return None
+        if str(lead.get("source", "")).startswith(self.COLD_SOURCES):
+            return ("contact with authors of monitored posts is disabled until a legal basis is recorded "
+                    "(leads.set_consent); automatic cold private messages are not supported")
+        return None
+
+    def set_consent(self, pid: str, lid: int, basis: str) -> dict:
+        basis = (basis or "").strip()
+        if len(basis) < 5:
+            raise ValueError("describe the basis for contact (e.g. 'person asked to be contacted in the group on 2026-10-26')")
+        lead = self.lead(pid, lid)
+        data = json.loads(lead["data"] or "{}")
+        data["consent_basis"], data["consent_at"] = basis[:500], _now()
+        self.db.x("UPDATE leads SET consent=1, data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), lid))
+        return self.lead(pid, lid)
 
     # ---- messages
     def _insert_msg(self, pid: str, lead_id: int, direction: str, body: str, status: str) -> int:
@@ -136,6 +227,8 @@ class Outreach:
         lead = self.lead(pid, lead_id)
         if lead["status"] == "opted_out":
             raise ValueError("lead opted out; will not message")
+        if (why := self.contact_block(lead)):
+            raise ValueError(why)
         mid = self._insert_msg(pid, lead_id, "out", body, "draft")
         if approve or not self.policy(pid)["require_approval"]:
             self.db.x("UPDATE messages SET status='approved' WHERE id=?", (mid,))
@@ -178,12 +271,20 @@ class Outreach:
         if not (pol["window"]["start"] <= self._local_hour(pol, now) < pol["window"]["end"]):
             res["skipped"] = "outside sending window"
             return res
+        if self.check_health(pid, now):
+            res["skipped"] = "circuit breaker tripped"
+            return res
         today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+        day_start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         for m in self.db.q("SELECT * FROM messages WHERE project_id=? AND direction='out' AND status='approved' "
                            "ORDER BY id LIMIT ?", (pid, max_messages)):
             lead = self.lead(pid, m["lead_id"])
             if lead["status"] in ("opted_out", "lost"):
                 self._finish(m["id"], "cancelled", f"lead is {lead['status']}")
+                res["cancelled"] += 1
+                continue
+            if (why := self.contact_block(lead)):
+                self._finish(m["id"], "cancelled", why[:200])
                 res["cancelled"] += 1
                 continue
             age = pol["max_lead_age_minutes"]
@@ -192,23 +293,49 @@ class Outreach:
                 self._finish(m["id"], "cancelled", "lead went stale (speed-to-lead window passed)")
                 res["cancelled"] += 1
                 continue
+            # per-person limits: a conversation the person started is exempt, unsolicited follow-ups are not
+            hist = self.db.one("SELECT COUNT(*) n, MAX(sent_at) t FROM messages WHERE lead_id=? AND direction='out' AND status='sent'", (lead["id"],))
+            reply = self.db.one("SELECT MAX(created_at) t FROM messages WHERE lead_id=? AND direction='in'", (lead["id"],))
+            replied = bool(reply and reply["t"] and reply["t"] > (hist["t"] or 0))
+            if not replied and hist["n"] >= pol["max_per_lead"]:
+                self._finish(m["id"], "cancelled", f"per-person limit reached ({pol['max_per_lead']} messages without a reply)")
+                res["cancelled"] += 1
+                continue
+            if not replied and hist["t"] and now - hist["t"] < pol["min_gap_hours"] * 3600:
+                res["skipped"] = "min gap between messages to one person"
+                continue
+            total = self.db.one("SELECT COUNT(*) n FROM messages WHERE project_id=? AND direction='out' AND status='sent' AND sent_at>=?", (pid, day_start))["n"]
+            if total >= pol["daily_cap_total"]:
+                res["skipped"] = "project daily cap reached"
+                break
             last = self.db.one("SELECT MAX(sent_at) t FROM messages WHERE project_id=? AND status='sent'", (pid,))
             if last and last["t"] and now - last["t"] < pol["min_interval_seconds"]:
                 res["skipped"] = "pacing"
                 break
             sender = self._pick_sender(pid, lead["channel"], today)
-            if not sender:  # don't let one channel's exhausted/missing sender block the others
+            if not sender:
                 res["skipped"] = "no sender with capacity for " + lead["channel"]
                 continue
+            text = m["body"] if hist["n"] else (m["body"] + ("\n\n" + pol["footer"] if pol["footer"] else ""))  # opt-out notice on first contact
             try:
-                ext = self._deliver(sender, lead, m["body"], now)
+                ext = self._deliver(sender, lead, text, now)
             except (ChannelError, httpx.HTTPError, ValueError) as e:
                 self._finish(m["id"], "failed", str(e)[:300], sender["label"])
                 res["failed"] += 1
+                streak = sender["fail_streak"] + 1
+                self.db.x("UPDATE senders SET fail_streak=? WHERE project_id=? AND label=?", (streak, pid, sender["label"]))
+                if any(k in str(e).lower() for k in LIMIT_MARKERS):
+                    self.trip(pid, f"platform limit/restriction signal: {str(e)[:150]}", sender["label"])
+                    res["skipped"] = "circuit breaker tripped"
+                    break
+                if streak >= pol["breaker"]["consecutive_failures"]:
+                    self.trip(pid, f"{streak} consecutive send failures", sender["label"])
+                    res["skipped"] = "circuit breaker tripped"
+                    break
                 continue
             self.db.x("UPDATE messages SET status='sent', sent_at=?, sender=?, error=? WHERE id=?",
                       (now, sender["label"], ext or "", m["id"]))
-            self.db.x("UPDATE senders SET sent_day=?, sent_today=? WHERE project_id=? AND label=?",
+            self.db.x("UPDATE senders SET sent_day=?, sent_today=?, fail_streak=0 WHERE project_id=? AND label=?",
                       (today, (sender["sent_today"] if sender["sent_day"] == today else 0) + 1, pid, sender["label"]))
             nxt = lead["next_touch"]
             if lead["source"] == "warm":
@@ -223,7 +350,10 @@ class Outreach:
 
     def _pick_sender(self, pid: str, channel: str, today: str) -> dict | None:
         best = None
-        for s in self.senders(pid):
+        pool = sorted(self.senders(pid), key=lambda x: x["label"])
+        if channel == "telegram":  # one account per Telegram channel: no rotation/failover to route around a limit
+            pool = [x for x in pool if self._serves(x, channel)][:1]
+        for s in pool:
             used = s["sent_today"] if s["sent_day"] == today else 0
             if s["status"] != "active" or used >= s["daily_cap"] or not self._serves(s, channel):
                 continue
@@ -259,10 +389,15 @@ class Outreach:
             lead = self.add_lead(pid, channel, address, name=name, source="inbound")
         self._insert_msg(pid, lead["id"], "in", text, "received")
         low = text.lower()
-        if any(w in low for w in self.policy(pid)["stop_words"]):
+        pol = self.policy(pid)
+        if any(w in low for w in pol["complaint_words"]):
+            self.db.add_event(pid, "outreach", "complaint", {"lead_id": lead["id"]})
+        if any(w in low for w in pol["stop_words"]):
+            self.db.add_event(pid, "outreach", "optout", {"lead_id": lead["id"]})
             self.db.x("UPDATE leads SET status='opted_out' WHERE id=?", (lead["id"],))
             self.db.x("UPDATE messages SET status='cancelled', error='opt-out' WHERE lead_id=? AND status IN ('draft','approved')",
                       (lead["id"],))
+            self.check_health(pid)
             return {"lead_id": lead["id"], "intent": "opt_out"}
         verdict = self._classify(pid, text)
         intent = verdict["intent"]
